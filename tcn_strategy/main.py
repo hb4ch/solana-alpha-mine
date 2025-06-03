@@ -510,8 +510,8 @@ def main():
         # Reduce configuration for quick testing
         config.training.num_epochs = 5
         config.training.batch_size = 32
-        config.model.num_layers = 4
-        config.model.hidden_channels = 64
+        config.model.num_layers = 2  # Reduced for quick mode
+        config.model.hidden_channels = 16  # Reduced for quick mode
         config.model.ensemble_size = 1
         config.data.sequence_length = 60
         print("\n🧪 Using Quick Test Configuration")

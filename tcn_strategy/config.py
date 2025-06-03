@@ -40,11 +40,11 @@ class FeatureConfig:
 class ModelConfig:
     """TCN model configuration"""
     input_channels: int = None  # Will be set based on features
-    hidden_channels: int = 64
-    num_layers: int = 5
+    hidden_channels: int = 32
+    num_layers: int = 3
     kernel_size: int = 3
     dilation_base: int = 2
-    dropout: float = 0.4
+    dropout: float = 0.5
     layer_norm: bool = True
     residual_connections: bool = True
     attention: bool = False  # Disable attention to reduce complexity

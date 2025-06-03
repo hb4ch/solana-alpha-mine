@@ -238,7 +238,6 @@ class TCNEnsemble(nn.Module):
         
         # Create ensemble of models with slightly different architectures
         self.models = nn.ModuleList()
-        # import copy # Ensure copy is imported if not already at the top of the file # Removed from here
 
         for i in range(self.ensemble_size):
             # Create a new Config object for this specific ensemble member
@@ -260,8 +259,9 @@ class TCNEnsemble(nn.Module):
 
 
             elif i == 2: # Third model
-                member_config.model.num_layers = max(6, config.model.num_layers - 1)
-                member_config.model.dropout = min(0.3, config.model.dropout + 0.05)
+                # Ensure num_layers is reduced or stays at a minimum of 1
+                member_config.model.num_layers = max(1, member_config.model.num_layers - 1) 
+                member_config.model.dropout = min(0.5, config.model.dropout + 0.05) # Adjusted max dropout to align with new base
             
             # All other models (i=0, and i > 2 if ensemble_size > 3) will use the base config.model settings
             # as per the deepcopy.
