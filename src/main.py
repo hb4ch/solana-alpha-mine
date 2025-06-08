@@ -1,6 +1,8 @@
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+import plotly.express as px
 import quantstats as qs
 qs.extend_pandas()
 import argparse
@@ -13,11 +15,11 @@ from strategies import MACDStrategy, RSIStrategy, MovingAverageCrossover
 MARKETS = ['BTC_USDT', 'ETH_USDT', 'SOL_USDT', 'BNB_USDT']
 DATA_PATH = 'crypto_tick'
 INITIAL_CAPITAL = 10000.0
-RISK_PER_TRADE = 0.01
+RISK_PER_TRADE = 0.1
 
 STRATEGIES = {
     'macd': (MACDStrategy, {'fast': 12, 'slow': 26, 'signal': 9}),
-    'rsi': (RSIStrategy, {'period': 14, 'overbought': 70, 'oversold': 30}),
+    'rsi': (RSIStrategy, {'period': 20, 'overbought': 70, 'oversold': 25}),
     'mac': (MovingAverageCrossover, {'fast_window': 10, 'slow_window': 30})
 }
 
@@ -26,14 +28,18 @@ def parse_args():
     parser.add_argument('--strategy', choices=STRATEGIES.keys(), default='macd',
                         help='Trading strategy to use (default: macd)')
     parser.add_argument('--confidence', type=float, default=0.0,
-                        help='Minimum confidence threshold for trades (0-100, default: 0)')
+                        help='Minimum confidence threshold for trades (0.0-1.0, default: 0.0)')
+    parser.add_argument('--leverage', type=float, default=1.0,
+                        help='Leverage to apply (e.g., 1.0, 2.0, 5.0, 10.0, default: 1.0 for no leverage)')
+    parser.add_argument('--funding_rate_daily', type=float, default=0.0001,
+                        help='Daily funding rate for borrowed capital (e.g., 0.0001 for 0.01%, default: 0.0001)')
     return parser.parse_args()
 
 def main():
     args = parse_args()
     strategy_class, strategy_params = STRATEGIES[args.strategy]
     
-    print(f"Starting alpha mining pipeline with {args.strategy.upper()} strategy (Confidence: {args.confidence})")
+    print(f"Starting alpha mining pipeline with {args.strategy.upper()} strategy (Confidence: {args.confidence}, Leverage: {args.leverage}x, Daily Funding Rate: {args.funding_rate_daily*100:.4f}%)")
     
     # Step 1: Load and preprocess data
     print(f"Loading all available market data...")
@@ -52,15 +58,38 @@ def main():
     backtester = GenericBacktester(
         strategy=strategy_class,
         strategy_params=strategy_params,
-        initial_capital=INITIAL_CAPITAL, 
+        initial_capital=INITIAL_CAPITAL,
         risk_per_trade=RISK_PER_TRADE,
-        confidence_threshold=args.confidence
+        confidence_threshold=args.confidence,
+        leverage=args.leverage,
+        funding_rate_daily=args.funding_rate_daily
     )
     backtester.backtest(data)
     
     # Step 4: Get results
     trades, equity = backtester.get_results()
     metrics = backtester.calculate_metrics(trades, equity)
+
+    # Display confidence histogram
+    if backtester.data is not None and 'confidence' in backtester.data.columns:
+        print("\n=== Confidence Score Distribution ===")
+        confidence_scores = backtester.data['confidence'].dropna()
+        if not confidence_scores.empty:
+            hist, bin_edges = np.histogram(confidence_scores, bins=10, range=(0,100)) # Confidence is 0-100
+            max_freq = hist.max()
+            # Scale histogram bars for text display (e.g., max 50 chars wide)
+            bar_scale = 50 / max_freq if max_freq > 0 else 1 
+            
+            print(f"{'Range':<12} | {'Frequency':<10} | Histogram")
+            print("-" * 50)
+            for i in range(len(hist)):
+                lower_bound = bin_edges[i]
+                upper_bound = bin_edges[i+1]
+                frequency = hist[i]
+                bar = '#' * int(frequency * bar_scale)
+                print(f"{lower_bound:.0f}-{upper_bound:<.0f}    \t | {frequency:<10} | {bar}")
+        else:
+            print("No confidence scores available to display histogram.")
 
     # Print Trade Log
     if not trades.empty:
@@ -99,8 +128,8 @@ def main():
                 # CAGR calculation in quantstats will fail with ZeroDivisionError.
                 print(f"\nSkipping QuantStats report: Not enough distinct timestamps in returns data ({returns.index.nunique()} unique). Annualized metrics like CAGR are undefined.")
             else:
-                report_title = f'{args.strategy.upper()} Strategy Backtest Report (Confidence: {args.confidence})'
-                report_filename = f'{args.strategy.lower()}_confidence_{args.confidence}_backtest_report.html'
+                report_title = f'{args.strategy.upper()} Strategy Backtest Report (Conf: {args.confidence}, Lev: {args.leverage}x)'
+                report_filename = f'{args.strategy.lower()}_conf_{args.confidence}_lev_{args.leverage}x_report.html'
 
                 # Determine periods_per_year for annualization based on actual data frequency
                 periods_per_year_for_stats = 365 * 24 * 12 # Default: approx 5-min frequency for a year (crypto)
@@ -163,41 +192,63 @@ def main():
         print("\nSkipping QuantStats report: Equity data is empty or missing required columns.")
         
     def plot_results(trades, equity, backtester, args, MARKETS):
-    # Plot equity curve
-        plt.figure(figsize=(12, 6))
-        equity.set_index('timestamp')['portfolio_value'].plot(title=f'Portfolio Value ({args.strategy.upper()} Strategy)')
-        plt.xlabel('Time')
-        plt.ylabel('Portfolio Value (USDT)')
-        plt.grid(True)
-        plt.savefig('equity_curve.png')
-        print("Saved equity curve to equity_curve.png")
+        # Plot equity curve
+        if not equity.empty and 'timestamp' in equity.columns and 'portfolio_value' in equity.columns:
+            # Ensure timestamp is datetime for Plotly
+            equity_plot_df = equity.copy()
+            equity_plot_df['timestamp'] = pd.to_datetime(equity_plot_df['timestamp'])
+            
+            fig_equity = px.line(equity_plot_df, x='timestamp', y='portfolio_value', 
+                                 title=f'Portfolio Value ({args.strategy.upper()} Strategy)',
+                                 labels={'timestamp': 'Time', 'portfolio_value': 'Portfolio Value (USDT)'})
+            fig_equity.update_layout(xaxis_title='Time', yaxis_title='Portfolio Value (USDT)')
+            fig_equity.write_html('equity_curve.html')
+            print("Saved interactive equity curve to equity_curve.html")
+        else:
+            print("Skipping equity curve plot: Data is empty or missing required columns.")
         
         # Plot trade outcomes
         if not trades.empty:
-            # Extract exit trades (which have profit info)
             exit_trades = trades[trades['action'] == 'exit']
+            if not exit_trades.empty:
+                # Profit Distribution
+                fig_profit_dist = px.histogram(exit_trades, x='profit', nbins=30, 
+                                               title='Profit Distribution per Trade',
+                                               labels={'profit': 'Profit (USDT)'})
+                fig_profit_dist.update_layout(xaxis_title='Profit (USDT)')
+                fig_profit_dist.write_html('profit_distribution.html')
+                print("Saved interactive profit distribution to profit_distribution.html")
+                
+                # Market performance breakdown
+                market_perf_data = exit_trades.groupby('market')['profit'].sum().reset_index()
+                if not market_perf_data.empty:
+                    fig_market_perf = px.bar(market_perf_data, x='market', y='profit',
+                                             title='Profit by Market',
+                                             labels={'market': 'Market', 'profit': 'Total Profit (USDT)'})
+                    fig_market_perf.update_layout(xaxis_title='Market', yaxis_title='Total Profit (USDT)')
+                    fig_market_perf.write_html('market_performance.html')
+                    print("Saved interactive market performance to market_performance.html")
+                else:
+                    print("Skipping market performance plot: No data after grouping.")
+            else:
+                print("Skipping trade outcome plots: No exit trades found.")
+        else:
+            print("Skipping trade outcome plots: No trades found.")
             
-            plt.figure(figsize=(10, 6))
-            sns.histplot(exit_trades['profit'], bins=30, kde=True)
-            plt.title('Profit Distribution per Trade')
-            plt.xlabel('Profit (USDT)')
-            plt.savefig('profit_distribution.png')
-            print("Saved profit distribution to profit_distribution.png")
-            
-            # Market performance breakdown
-            plt.figure(figsize=(10, 6))
-            market_perf = exit_trades.groupby('market')['profit'].sum()
-            market_perf.plot(kind='bar')
-            plt.title('Profit by Market')
-            plt.ylabel('Total Profit (USDT)')
-            plt.savefig('market_performance.png')
-            print("Saved market performance to market_performance.png")
-        
-        # Strategy-specific visualizations
+        # Strategy-specific visualizations (now interactive HTML)
+        print("Generating strategy-specific interactive indicator plots (HTML)...")
         for market in MARKETS:
-            fig = backtester.strategy.plot_indicators(backtester.data, market)
-            fig.savefig(f'{args.strategy}_indicators_{market}.png')
-            print(f"Saved {args.strategy.upper()} indicators for {market} to {args.strategy}_indicators_{market}.png")
+            try:
+                # plot_indicators now returns a plotly.graph_objects.Figure
+                plotly_fig = backtester.strategy.plot_indicators(backtester.data, market)
+                if plotly_fig is not None: 
+                    plot_filename = f'{args.strategy}_indicators_{market}.html'
+                    plotly_fig.write_html(plot_filename)
+                    print(f"Saved interactive {args.strategy.upper()} indicators for {market} to {plot_filename}")
+                else:
+                    print(f"Indicator plot for {market} was not generated by strategy.")
+            except Exception as e:
+                print(f"Error generating/saving interactive indicator plot for {market}: {e}")
         
     plot_results(trades, equity, backtester, args, MARKETS)
     print("\nPipeline execution complete")

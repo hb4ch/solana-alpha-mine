@@ -14,108 +14,168 @@ class GenericBacktester:
         risk_per_trade: Percentage of capital to risk per trade
     """
     def __init__(self, 
-                 strategy: Type[TradingStrategy], 
-                 strategy_params: dict = {}, 
-                 initial_capital: float = 10000.0, 
+                 strategy: Type[TradingStrategy],
+                 strategy_params: dict = {},
+                 initial_capital: float = 10000.0,
                  risk_per_trade: float = 0.01,
-                 confidence_threshold: float = 0.0):  # Default to 0 (all trades)
+                 confidence_threshold: float = 0.0,
+                 leverage: float = 1.0,
+                 funding_rate_daily: float = 0.0001):  # Default to 0 (all trades), 0.01% daily funding
         self.strategy = strategy(**strategy_params)
         self.initial_capital = initial_capital
         self.risk_per_trade = risk_per_trade
         self.confidence_threshold = confidence_threshold
-        self.portfolio = initial_capital
-        self.positions: Dict[str, Dict[str, float]] = {}  # market -> {'size': float, 'entry_price': float, 'entry_fee': float}
+        self.leverage = leverage
+        if self.leverage <= 0:
+            raise ValueError("Leverage must be positive.")
+        self.funding_rate_daily = funding_rate_daily
+        self.portfolio = initial_capital  # Represents available cash
+        # market -> {'size': float (notional), 'entry_price': float, 'entry_fee': float, 
+        #            'margin_used': float, 'borrowed_amount': float, 'entry_timestamp': pd.Timestamp, 'leverage': float}
+        self.positions: Dict[str, Dict[str, any]] = {}
         self.trade_log = []
         self.equity_curve = []
         self.data = None
 
     def calculate_position_size(self, price: float, volatility: float) -> float:
         """
-        Calculate position size based on volatility and risk parameters
+        Calculate NOTIONAL position size based on volatility, risk parameters, and leverage.
         
         Args:
             price: Current price of the asset
-            volatility: Current volatility measure (ATR equivalent)
+            volatility: Current volatility measure (ATR equivalent, absolute price change)
             
         Returns:
-            Position size in asset units
+            Notional position size in asset units.
         """
-        if volatility <= 0:
+        if volatility <= 0 or self.leverage == 0 or price <= 0:
             return 0
             
-        risk_amount = self.portfolio * self.risk_per_trade
-        position_size = risk_amount / volatility
+        # Risk amount based on initial capital to stabilize trade sizing under leverage
+        # self.portfolio (cash) can fluctuate wildly due to margin calls.
+        risk_amount_dollar = self.initial_capital * self.risk_per_trade
         
-        # Add constraints to prevent overexposure:
-        # 1. Never risk more than 5% of portfolio in a single trade
-        max_risk_size = self.portfolio * 0.05 / price
-        # 2. Ensure position doesn't exceed available capital
-        max_affordable = (self.portfolio * 0.99) / price  # Leave 1% buffer
+        # Notional size such that if price moves by `volatility`, PnL on notional is `risk_amount_dollar`
+        notional_size_based_on_risk = risk_amount_dollar / volatility
         
-        # Adaptive sizing based on market conditions
-        base_size = min(position_size, max_risk_size, max_affordable)
+        # Max affordable notional size based on available margin
+        # Margin required = (Notional Size * price) / leverage
+        # We need Margin required <= self.portfolio * 0.99 (leaving 1% buffer)
+        max_notional_affordable = (self.portfolio * 0.99 * self.leverage) / price
         
-        # Scale up during high volatility
-        if volatility > price * 0.001:  # >0.1%
-            return base_size * 1.5
-        return base_size
+        base_notional_size = min(notional_size_based_on_risk, max_notional_affordable)
+        
+        # Adaptive sizing based on market conditions (applies to notional size)
+        if volatility > price * 0.001:  # >0.1% price fluctuation
+            final_notional_size = base_notional_size * 1.5
+        else:
+            final_notional_size = base_notional_size
+        
+        # Ensure margin needed for the final_notional_size does not exceed available portfolio cash
+        margin_needed = (final_notional_size * price) / self.leverage if self.leverage > 0 else float('inf')
+
+        if margin_needed > self.portfolio:
+            # Adjust notional size to what can be afforded with current cash
+            final_notional_size = (self.portfolio * self.leverage) / price if price > 0 else 0
+            
+        return final_notional_size if self.leverage > 0 else 0
 
     def execute_trade(self, market: str, price: float, size: float, direction: str, timestamp: pd.Timestamp):
         """
-        Execute a trade and update portfolio
+        Execute a trade and update portfolio (cash).
         
         Args:
             market: Trading pair symbol
             price: Execution price
-            size: Position size in asset units
+            size: Notional position size in asset units
             direction: 'long' or 'exit'
             timestamp: Time of trade
         """
-        cost = price * size
+        if self.leverage == 0 and size > 0: # Should be caught by calculate_position_size
+            return
+
+        notional_value = price * size
         
         if direction == 'long':
-            fee = cost * 0.0002  # Fee for entry
-            self.portfolio -= (cost + fee)
-            self.positions[market] = {'size': size, 'entry_price': price, 'entry_fee': fee}
+            if self.leverage == 1.0:
+                margin_used = notional_value
+                borrowed_amount = 0.0
+            else:
+                margin_used = notional_value / self.leverage
+                borrowed_amount = notional_value - margin_used
+
+            if margin_used > self.portfolio and not np.isclose(margin_used, self.portfolio): # Add tolerance for float precision
+                # This check is a safeguard; calculate_position_size should prevent this.
+                print(f"Timestamp: {timestamp}, Market: {market} - Insufficient cash for margin. Needed: {margin_used:.2f}, Have: {self.portfolio:.2f}. Skipping trade.")
+                return
+
+            entry_fee = notional_value * 0.1 * 0.01 # Regular user fee on notional value, 0.1 percent
+
+            self.portfolio -= (margin_used + entry_fee) # Cash decreases
+            self.positions[market] = {
+                'size': size, # Notional size
+                'entry_price': price,
+                'entry_fee_paid': entry_fee, # Store the actual fee paid on entry
+                'margin_used': margin_used,
+                'borrowed_amount': borrowed_amount,
+                'entry_timestamp': timestamp,
+                'leverage': self.leverage # Store leverage used for this position
+            }
             self.trade_log.append({
                 'timestamp': timestamp,
                 'market': market,
                 'action': 'enter',
                 'price': price,
-                'size': size,
-                'fee': fee 
+                'size': size, # Notional size
+                'fee': entry_fee,
+                'leverage': self.leverage,
+                'margin_used': margin_used
             })
         elif direction == 'exit' and market in self.positions:
-            current_position_details = self.positions[market]
-            position_size = current_position_details['size']
-            entry_price = current_position_details['entry_price']
-            entry_fee = current_position_details['entry_fee']
+            pos_details = self.positions[market]
+            position_notional_size = pos_details['size']
+            entry_price = pos_details['entry_price']
+            entry_fee_paid = pos_details['entry_fee_paid'] # Fee paid at entry
+            margin_used = pos_details['margin_used']
+            borrowed_amount = pos_details['borrowed_amount']
+            entry_timestamp = pos_details['entry_timestamp']
+            position_leverage = pos_details['leverage']
 
-            exit_value = price * position_size # `price` here is exit_price
-            exit_fee = exit_value * 0.0002 # Fee for exit
+            exit_notional_value = price * position_notional_size # `price` here is exit_price
+            exit_fee = exit_notional_value * 0.1 * 0.01 # Regular user fee on notional value, 0.1 percent
 
-            self.portfolio += (exit_value - exit_fee)
+            funding_cost = 0.0
+            if position_leverage > 1.0 and borrowed_amount > 0:
+                days_held = (timestamp - entry_timestamp).total_seconds() / (24 * 60 * 60)
+                days_held = max(0, days_held) # Ensure non-negative
+                funding_cost = borrowed_amount * self.funding_rate_daily * days_held
+            
+            pnl_on_notional = (price - entry_price) * position_notional_size
+            
+            # Update cash portfolio
+            self.portfolio += (margin_used + pnl_on_notional - exit_fee - funding_cost)
 
-            # Calculate profit for this round trip
-            profit_for_trade = (exit_value - (entry_price * position_size)) - (entry_fee + exit_fee)
+            profit_for_trade = pnl_on_notional - entry_fee_paid - exit_fee - funding_cost
             
             self.trade_log.append({
                 'timestamp': timestamp,
                 'market': market,
                 'action': 'exit',
                 'price': price, # This is exit_price
-                'size': position_size,
-                'fee': exit_fee, # This is exit_fee
-                'profit': profit_for_trade
+                'size': position_notional_size, # Notional size
+                'fee': exit_fee, # Exit fee
+                'funding_cost': funding_cost,
+                'profit': profit_for_trade,
+                'leverage': position_leverage
             })
             del self.positions[market]
         
-        # Record portfolio value
+        # Record portfolio value (cash)
         self.equity_curve.append({
             'timestamp': timestamp,
-            'portfolio_value': self.portfolio,
+            'portfolio_value': self.portfolio, # Tracks cash available
             'cash': self.portfolio,
-            'positions': self.positions.copy()
+            'positions': {m: {'size': p['size'], 'entry_price': p['entry_price'], 'leverage': p['leverage']} for m, p in self.positions.items()} # Snapshot of open positions
         })
 
     def backtest(self, data: pd.DataFrame):
@@ -146,34 +206,48 @@ class GenericBacktester:
                 'positions': {} # No positions at the start
             })
         
-        # Group by market and iterate
-        grouped = data.groupby('market')
-        for market, group in grouped:
-            # Sort by time
-            group = group.sort_index()
-            in_trade = False
+        # Sort data by timestamp to process events chronologically across all markets
+        data = data.sort_index()
+
+        # Dictionary to keep track of whether we are in a trade for each market
+        in_trade_for_market: Dict[str, bool] = {market: False for market in data['market'].unique()}
+        
+        # Iterate through the data chronologically
+        for idx, row in data.iterrows():
+            market = row['market']
+            current_price = row['mid_price']
+            volatility = row.get('volatility', 0.01) # Default volatility
+            confidence = row.get('confidence', 0.0)
+
+            # Check for entry signal for the current market
+            if not in_trade_for_market.get(market, False) and row.get('entry_signal', False) and confidence >= self.confidence_threshold:
+                position_size = self.calculate_position_size(current_price, volatility)
+                if position_size > 0:
+                    self.execute_trade(market, current_price, position_size, 'long', idx)
+                    in_trade_for_market[market] = True
             
-            for idx, row in group.iterrows():
-                # Check for entry signal
-                # confidence = row.get('confidence', 0.0)
-                # print(f"Confidence level for {market} at {idx}: {confidence}")
-                if not in_trade and row.get('entry_signal', False) and row.get('confidence', 0) >= self.confidence_threshold:
-                    position_size = self.calculate_position_size(
-                        row['mid_price'], 
-                        row.get('volatility', 0.01)  # Default volatility if not present
-                    )
-                    if position_size > 0:
-                        self.execute_trade(market, row['mid_price'], position_size, 'long', idx)
-                        in_trade = True
-                
-                # Check for exit signal
-                if in_trade and row.get('exit_signal', False):
-                    self.execute_trade(market, row['mid_price'], 0, 'exit', idx)
-                    in_trade = False
-            
-            # Close any open positions at end
-            if in_trade:
-                self.execute_trade(market, group.iloc[-1]['mid_price'], 0, 'exit', group.index[-1])
+            # Check for exit signal for the current market
+            elif in_trade_for_market.get(market, False) and row.get('exit_signal', False):
+                # Ensure the position exists before trying to exit; execute_trade handles this internally too
+                if market in self.positions:
+                    self.execute_trade(market, current_price, 0, 'exit', idx) # Size 0 for exit indicates closing the existing position
+                    in_trade_for_market[market] = False
+
+        # Close any open positions at the end of the backtest for each market
+        # We need the last known price for each market to close positions
+        last_prices = data.groupby('market')['mid_price'].last()
+        last_timestamps = data.groupby('market').apply(lambda x: x.index[-1])
+
+        for market, is_in_trade in in_trade_for_market.items():
+            if is_in_trade and market in self.positions: # Check self.positions as well for robustness
+                if market in last_prices and market in last_timestamps:
+                    last_price_for_market = last_prices[market]
+                    last_timestamp_for_market = last_timestamps[market]
+                    self.execute_trade(market, last_price_for_market, 0, 'exit', last_timestamp_for_market)
+                    in_trade_for_market[market] = False # Update status
+                else:
+                    # This case should ideally not happen if data is consistent
+                    print(f"Warning: Could not find last price/timestamp for market {market} to close open position.")
                 
     def get_results(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
