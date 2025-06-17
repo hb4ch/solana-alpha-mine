@@ -2,6 +2,11 @@ import pandas as pd
 import numpy as np
 from typing import Dict, Tuple, Type
 from strategies import TradingStrategy
+from features import engineer_features
+from ml_strategy import MLTradingStrategy
+import logging
+
+logger = logging.getLogger(__name__)
 
 class GenericBacktester:
     """
@@ -20,10 +25,12 @@ class GenericBacktester:
                  risk_per_trade: float = 0.01,
                  confidence_threshold: float = 0.0,
                  leverage: float = 1.0,
-                 funding_rate_daily: float = 0.0001):  # Default to 0 (all trades), 0.01% daily funding
+                 funding_rate_daily: float = 0.0001, # Default to 0 (all trades), 0.01% daily funding
+                 selected_markets: list = None): 
         self.strategy = strategy(**strategy_params)
         self.initial_capital = initial_capital
         self.risk_per_trade = risk_per_trade
+        self.selected_markets = selected_markets
         self.confidence_threshold = confidence_threshold
         self.leverage = leverage
         if self.leverage <= 0:
@@ -112,15 +119,23 @@ class GenericBacktester:
             entry_fee = notional_value * 0.1 * 0.01 # Regular user fee on notional value, 0.1 percent
 
             self.portfolio -= (margin_used + entry_fee) # Cash decreases
-            self.positions[market] = {
-                'size': size, # Notional size
+            position_details = {
+                'size': size,
                 'entry_price': price,
-                'entry_fee_paid': entry_fee, # Store the actual fee paid on entry
+                'entry_fee_paid': entry_fee,
                 'margin_used': margin_used,
                 'borrowed_amount': borrowed_amount,
                 'entry_timestamp': timestamp,
-                'leverage': self.leverage # Store leverage used for this position
+                'leverage': self.leverage
             }
+
+            # If using ML strategy, add triple barrier info
+            if isinstance(self.strategy, MLTradingStrategy):
+                position_details['tp_price'] = price * (1 + self.strategy.tp_pct)
+                position_details['sl_price'] = price * (1 - self.strategy.sl_pct)
+                position_details['time_barrier'] = timestamp + pd.Timedelta(seconds=self.strategy.horizon_seconds)
+
+            self.positions[market] = position_details
             self.trade_log.append({
                 'timestamp': timestamp,
                 'market': market,
@@ -190,9 +205,30 @@ class GenericBacktester:
         self.positions = {}
         self.trade_log = []
         self.equity_curve = []
+
+        # --- ML Workflow Enhancement ---
+        # 1. Engineer features if using an ML strategy
+        logger.info("Running feature engineering...")
+        # The raw data needs to be processed to create features for the model.
+        # We assume the input `data` is the raw data from the loader.
+        data_with_features = engineer_features(data.copy())
         
-        # Apply strategy to generate signals
-        data = self.strategy.generate_signals(data)
+        # 2. Apply strategy to generate signals
+        logger.info("Generating signals from strategy...")
+        data_with_signals = self.strategy.generate_signals(data_with_features)
+        
+        # From here on, use the data with signals
+        data = data_with_signals
+        # --- End of ML Workflow Enhancement ---
+
+        # Filter data for selected markets if specified
+        if self.selected_markets:
+            data = data[data['market'].isin(self.selected_markets)]
+            if data.empty:
+                print(f"Warning: No data found for selected markets: {self.selected_markets}. Backtest will not run.")
+                self.data = data # Store empty dataframe
+                return # Exit if no data for selected markets
+
         self.data = data
 
         # Add initial equity point IF data is not empty and has a DatetimeIndex
@@ -210,14 +246,49 @@ class GenericBacktester:
         data = data.sort_index()
 
         # Dictionary to keep track of whether we are in a trade for each market
-        in_trade_for_market: Dict[str, bool] = {market: False for market in data['market'].unique()}
+        # Initialize based on unique markets in the (potentially filtered) data
+        active_markets = data['market'].unique()
+        if not active_markets.size: # Check if active_markets is empty
+             print("Warning: No active markets to trade after filtering. Backtest will not proceed with trading logic.")
+             # Still record initial equity if not already done, and then can return or let it pass if equity curve is desired
+             if not self.equity_curve: # Ensure initial equity is recorded if it wasn't
+                if not data.empty and isinstance(data.index, pd.DatetimeIndex) and len(data.index) > 0:
+                    initial_timestamp = data.index.min()
+                    self.equity_curve.append({
+                        'timestamp': initial_timestamp,
+                        'portfolio_value': self.initial_capital,
+                        'cash': self.initial_capital,
+                        'positions': {}
+                    })
+             return
+
+
+        in_trade_for_market: Dict[str, bool] = {market: False for market in active_markets}
         
         # Iterate through the data chronologically
         for idx, row in data.iterrows():
             market = row['market']
             current_price = row['mid_price']
-            volatility = row.get('volatility', 0.01) # Default volatility
+            # Use 'volatility_20p' from features, with a fallback
+            volatility = row.get('volatility_20p', 0.01) 
             confidence = row.get('confidence', 0.0)
+
+            # --- Triple Barrier Exit Logic ---
+            if in_trade_for_market.get(market, False) and market in self.positions:
+                pos = self.positions[market]
+                exit_reason = None
+                if 'tp_price' in pos and current_price >= pos['tp_price']:
+                    exit_reason = 'TP'
+                elif 'sl_price' in pos and current_price <= pos['sl_price']:
+                    exit_reason = 'SL'
+                elif 'time_barrier' in pos and idx >= pos['time_barrier']:
+                    exit_reason = 'Time'
+                
+                if exit_reason:
+                    logger.info(f"Exit for {market} at {current_price:.2f} due to {exit_reason} at {idx}")
+                    self.execute_trade(market, current_price, 0, 'exit', idx)
+                    in_trade_for_market[market] = False
+                    continue # Skip to next row after processing exit
 
             # Check for entry signal for the current market
             if not in_trade_for_market.get(market, False) and row.get('entry_signal', False) and confidence >= self.confidence_threshold:
@@ -226,28 +297,33 @@ class GenericBacktester:
                     self.execute_trade(market, current_price, position_size, 'long', idx)
                     in_trade_for_market[market] = True
             
-            # Check for exit signal for the current market
+            # Check for explicit exit signal from strategy (e.g., for non-triple-barrier models)
             elif in_trade_for_market.get(market, False) and row.get('exit_signal', False):
-                # Ensure the position exists before trying to exit; execute_trade handles this internally too
                 if market in self.positions:
-                    self.execute_trade(market, current_price, 0, 'exit', idx) # Size 0 for exit indicates closing the existing position
+                    self.execute_trade(market, current_price, 0, 'exit', idx)
                     in_trade_for_market[market] = False
 
         # Close any open positions at the end of the backtest for each market
         # We need the last known price for each market to close positions
-        last_prices = data.groupby('market')['mid_price'].last()
-        last_timestamps = data.groupby('market').apply(lambda x: x.index[-1])
+        # Ensure data is not empty before attempting groupby
+        if not data.empty:
+            last_prices = data.groupby('market')['mid_price'].last()
+            last_timestamps = data.groupby('market').apply(lambda x: x.index[-1])
 
-        for market, is_in_trade in in_trade_for_market.items():
-            if is_in_trade and market in self.positions: # Check self.positions as well for robustness
-                if market in last_prices and market in last_timestamps:
-                    last_price_for_market = last_prices[market]
-                    last_timestamp_for_market = last_timestamps[market]
-                    self.execute_trade(market, last_price_for_market, 0, 'exit', last_timestamp_for_market)
-                    in_trade_for_market[market] = False # Update status
-                else:
-                    # This case should ideally not happen if data is consistent
-                    print(f"Warning: Could not find last price/timestamp for market {market} to close open position.")
+            for market, is_in_trade in in_trade_for_market.items():
+                if is_in_trade and market in self.positions: # Check self.positions as well for robustness
+                    if market in last_prices and market in last_timestamps:
+                        last_price_for_market = last_prices[market]
+                        last_timestamp_for_market = last_timestamps[market]
+                        self.execute_trade(market, last_price_for_market, 0, 'exit', last_timestamp_for_market)
+                        in_trade_for_market[market] = False # Update status
+                    else:
+                        # This case should ideally not happen if data is consistent
+                        print(f"Warning: Could not find last price/timestamp for market {market} to close open position.")
+        elif self.equity_curve and not self.positions: # If data was empty from the start but initial equity was logged
+            pass # Nothing to close
+        else: # Data became empty after filtering, or was empty and no initial equity logged
+             print("Warning: Data is empty, cannot close open positions.")
                 
     def get_results(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
