@@ -60,8 +60,22 @@ def engineer_features(df: pd.DataFrame, N_levels: int = 5) -> pd.DataFrame:
 
     # --- Technical Indicators ---
     logger.info("Calculating technical indicators...")
+
+    # RSI with multiple periods
+    df['rsi_7'] = df.groupby('market')['mid_price'].transform(lambda x: rsi(x, period=7))
     df['rsi_14'] = df.groupby('market')['mid_price'].transform(lambda x: rsi(x, period=14))
+    df['rsi_21'] = df.groupby('market')['mid_price'].transform(lambda x: rsi(x, period=21))
     
+    # RSI divergence features (example using rolling max/min)
+    df['rsi_overbought'] = df.groupby('market')['rsi_14'].transform(lambda x: x.rolling(20).max())
+    df['rsi_oversold'] = df.groupby('market')['rsi_14'].transform(lambda x: x.rolling(20).min())
+    
+    # RSI momentum (difference between current and previous RSI)
+    df['rsi_momentum'] = df.groupby('market')['rsi_14'].transform(lambda x: x.diff(1))
+    
+    # RSI EMA (exponential moving average of RSI)
+    df['rsi_ema_9'] = df.groupby('market')['rsi_14'].transform(lambda x: x.ewm(span=9, adjust=False).mean())
+
     # Calculate MACD per group and assign back to the original dataframe
     for market_name, group_df in df.groupby('market'):
         macd_results = macd(group_df['mid_price'])

@@ -41,7 +41,8 @@ STRATEGY_CONFIG = {
 # The trainer will dynamically add one-hot encoded columns.
 BASE_FEATURES = [
     'wap', 'obi_level5', 'bid_depth_level5', 'ask_depth_level5',
-    'rsi_14', 'macd_line', 'macd_histogram',
+    'rsi_7', 'rsi_14', 'rsi_21', 'rsi_overbought', 'rsi_oversold', 'rsi_momentum', 'rsi_ema_9',
+    'macd_line', 'macd_histogram',
     'volume_1m_sma20', 'spread_abs_sma20', 'volatility_20p',
     'sol_vs_btc_price_ratio', 'sol_vs_eth_price_ratio', 'sol_vs_bnb_price_ratio',
     'btc_return_lag1', 'eth_return_lag1', 'bnb_return_lag1',
