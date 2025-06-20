@@ -62,6 +62,8 @@ def generate_target_variable(df: pd.DataFrame, market_to_predict: str = 'SOL_USD
     else:
         ticks_per_second = 1 / time_diffs.total_seconds()
     
+    logger.info(f"time_diff mean amongst tick is f{time_diffs.total_seconds()}")
+
     horizon_steps = int(horizon_seconds * ticks_per_second)
     if horizon_steps == 0:
         logger.warning("Horizon results in 0 steps. Target generation might not be meaningful.")
