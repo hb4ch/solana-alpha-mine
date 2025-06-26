@@ -1,16 +1,15 @@
-import pandas as pd
+import polars as pl
 import numpy as np
-# import matplotlib.pyplot as plt # No longer directly used for plotting here
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from typing import Tuple, Optional
 
 class TradingStrategy:
-    def generate_signals(self, data: pd.DataFrame) -> pd.DataFrame:
+    def generate_signals(self, data: pl.DataFrame) -> pl.DataFrame:
         """Generate trading signals (entry/exit) from market data"""
         raise NotImplementedError
         
-    def plot_indicators(self, data: pd.DataFrame, market: str) -> go.Figure:
+    def plot_indicators(self, data: pl.DataFrame, market: str) -> go.Figure:
         """Plot technical indicators for visual analysis"""
         raise NotImplementedError
 
@@ -20,47 +19,46 @@ class MACDStrategy(TradingStrategy):
         self.slow = slow
         self.signal = signal
     
-    def generate_signals(self, data: pd.DataFrame) -> pd.DataFrame:
-        df = data.copy().reset_index()
-        
-        # Calculate MACD components
-        df['ema_fast'] = df.groupby('market')['mid_price'].transform(
-            lambda x: x.ewm(span=self.fast).mean()
+    def generate_signals(self, data: pl.DataFrame) -> pl.DataFrame:
+        df = data.with_columns([
+            pl.col('mid_price').ewm_mean(span=self.fast).over('market').alias('ema_fast'),
+            pl.col('mid_price').ewm_mean(span=self.slow).over('market').alias('ema_slow')
+        ])
+        df = df.with_columns(
+            (pl.col('ema_fast') - pl.col('ema_slow')).alias('macd')
         )
-        df['ema_slow'] = df.groupby('market')['mid_price'].transform(
-            lambda x: x.ewm(span=self.slow).mean()
+        df = df.with_columns(
+            pl.col('macd').ewm_mean(span=self.signal).over('market').alias('signal_line')
         )
-        df['macd'] = df['ema_fast'] - df['ema_slow']
-        df['signal_line'] = df.groupby('market')['macd'].transform(
-            lambda x: x.ewm(span=self.signal).mean()
+        df = df.with_columns(
+            (pl.col('macd') - pl.col('signal_line')).alias('histogram')
         )
-        df['histogram'] = df['macd'] - df['signal_line']
         
-        # Generate signals
-        df['prev_hist'] = df.groupby('market')['histogram'].shift(1)
-        df['entry_signal'] = (df['histogram'] > 0) & (df['prev_hist'] <= 0)
-        df['exit_signal'] = (df['histogram'] < 0) & (df['prev_hist'] >= 0)
+        df = df.with_columns(
+            pl.col('histogram').shift(1).over('market').alias('prev_hist')
+        )
+        df = df.with_columns([
+            ((pl.col('histogram') > 0) & (pl.col('prev_hist') <= 0)).alias('entry_signal'),
+            ((pl.col('histogram') < 0) & (pl.col('prev_hist') >= 0)).alias('exit_signal')
+        ])
         
-        # Confidence score (0-100)
-        # Increased scaling factor for more sensitivity
-        df['confidence'] = (abs(df['histogram']) / df['mid_price'] * 200000).clip(0, 100)
+        df = df.with_columns(
+            (abs(pl.col('histogram')) / pl.col('mid_price') * 200000).clip(0, 100).alias('confidence')
+        )
         
-        return df.set_index('ts_utc')
+        return df
 
-    def plot_indicators(self, data: pd.DataFrame, market: str, min_confidence: float = 30) -> go.Figure:
-        market_data = data[data['market'] == market].copy() # Use .copy() to avoid SettingWithCopyWarning
-        # Ensure index is datetime for Plotly
-        if not isinstance(market_data.index, pd.DatetimeIndex):
-            market_data.index = pd.to_datetime(market_data.index)
+    def plot_indicators(self, data: pl.DataFrame, market: str, min_confidence: float = 30) -> go.Figure:
+        market_data = data.filter(pl.col('market') == market).to_pandas()
+        market_data['ts_utc'] = market_data['ts_utc'].dt.to_pydatetime()
+        market_data = market_data.set_index('ts_utc')
 
         fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1,
                             subplot_titles=(f'{market} Price', f'{market} MACD'))
         
-        # Price
         fig.add_trace(go.Scatter(x=market_data.index, y=market_data['mid_price'], name='Price', line=dict(color='blue')), 
                       row=1, col=1)
 
-        # Entry and Exit signals based on confidence
         entry_points = market_data[(market_data['entry_signal']) & (market_data['confidence'] >= min_confidence)]
         exit_points = market_data[(market_data['exit_signal']) & (market_data['confidence'] >= min_confidence)]
         
@@ -71,13 +69,11 @@ class MACDStrategy(TradingStrategy):
                                  marker=dict(color='red', size=10, symbol='triangle-down'), legendgroup='signals'), 
                       row=1, col=1)
         
-        # MACD
         fig.add_trace(go.Scatter(x=market_data.index, y=market_data['macd'], name='MACD', line=dict(color='purple')), 
                       row=2, col=1)
         fig.add_trace(go.Scatter(x=market_data.index, y=market_data['signal_line'], name='Signal Line', line=dict(color='orange')), 
                       row=2, col=1)
         
-        # Histogram
         colors = ['green' if val >= 0 else 'red' for val in market_data['histogram']]
         fig.add_trace(go.Bar(x=market_data.index, y=market_data['histogram'], name='Histogram', marker_color=colors), 
                       row=2, col=1)
@@ -93,43 +89,40 @@ class MovingAverageCrossover(TradingStrategy):
         self.fast_window = fast_window
         self.slow_window = slow_window
     
-    def generate_signals(self, data: pd.DataFrame) -> pd.DataFrame:
-        df = data.copy().reset_index()
+    def generate_signals(self, data: pl.DataFrame) -> pl.DataFrame:
+        df = data.with_columns([
+            pl.col('mid_price').rolling_mean(self.fast_window).over('market').alias('fast_ma'),
+            pl.col('mid_price').rolling_mean(self.slow_window).over('market').alias('slow_ma')
+        ])
         
-        # Calculate moving averages
-        df['fast_ma'] = df.groupby('market')['mid_price'].transform(
-            lambda x: x.rolling(self.fast_window).mean()
+        df = df.with_columns([
+            pl.col('fast_ma').shift(1).over('market').alias('prev_fast'),
+            pl.col('slow_ma').shift(1).over('market').alias('prev_slow')
+        ])
+        
+        df = df.with_columns([
+            ((pl.col('fast_ma') > pl.col('slow_ma')) & (pl.col('prev_fast') <= pl.col('prev_slow'))).alias('entry_signal'),
+            ((pl.col('fast_ma') < pl.col('slow_ma')) & (pl.col('prev_fast') >= pl.col('prev_slow'))).alias('exit_signal')
+        ])
+        
+        gap = abs(pl.col('fast_ma') - pl.col('slow_ma')) / pl.col('mid_price')
+        df = df.with_columns(
+            (gap * 5000).clip(0, 100).alias('confidence')
         )
-        df['slow_ma'] = df.groupby('market')['mid_price'].transform(
-            lambda x: x.rolling(self.slow_window).mean()
-        )
         
-        # Generate signals
-        df['prev_fast'] = df.groupby('market')['fast_ma'].shift(1)
-        df['prev_slow'] = df.groupby('market')['slow_ma'].shift(1)
-        df['entry_signal'] = (df['fast_ma'] > df['slow_ma']) & (df['prev_fast'] <= df['prev_slow'])
-        df['exit_signal'] = (df['fast_ma'] < df['slow_ma']) & (df['prev_fast'] >= df['prev_slow'])
-        
-        # Confidence score (0-100)
-        gap = abs(df['fast_ma'] - df['slow_ma']) / df['mid_price']
-        # Adjusted scaling: e.g., a 0.2% gap (0.002) -> confidence 10; 1% gap (0.01) -> confidence 50
-        df['confidence'] = (gap * 5000).clip(0, 100)
-        
-        return df.set_index('ts_utc')
+        return df
 
-    def plot_indicators(self, data: pd.DataFrame, market: str, min_confidence: float = 30) -> go.Figure:
-        market_data = data[data['market'] == market].copy()
-        if not isinstance(market_data.index, pd.DatetimeIndex):
-            market_data.index = pd.to_datetime(market_data.index)
+    def plot_indicators(self, data: pl.DataFrame, market: str, min_confidence: float = 30) -> go.Figure:
+        market_data = data.filter(pl.col('market') == market).to_pandas()
+        market_data['ts_utc'] = market_data['ts_utc'].dt.to_pydatetime()
+        market_data = market_data.set_index('ts_utc')
 
         fig = go.Figure()
         
-        # Price and MAs
         fig.add_trace(go.Scatter(x=market_data.index, y=market_data['mid_price'], name='Price', line=dict(color='blue')))
         fig.add_trace(go.Scatter(x=market_data.index, y=market_data['fast_ma'], name=f'Fast MA ({self.fast_window})', line=dict(color='orange', dash='dash')))
         fig.add_trace(go.Scatter(x=market_data.index, y=market_data['slow_ma'], name=f'Slow MA ({self.slow_window})', line=dict(color='green', dash='dash')))
         
-        # Signal markers (filtered by confidence)
         entry_points = market_data[(market_data['entry_signal']) & (market_data['confidence'] >= min_confidence)]
         exit_points = market_data[(market_data['exit_signal']) & (market_data['confidence'] >= min_confidence)]
         
@@ -149,73 +142,56 @@ class RSIStrategy(TradingStrategy):
         self.overbought = overbought
         self.oversold = oversold
     
-    def generate_signals(self, data: pd.DataFrame) -> pd.DataFrame:
-        df = data.copy().reset_index() # Ensure 'market' is a column and we have a default index
+    def generate_signals(self, data: pl.DataFrame) -> pl.DataFrame:
+        # Calculate RSI using a more straightforward approach
+        df = data.with_columns([
+            pl.col('mid_price').diff(1).over('market').alias('price_delta')
+        ])
         
-        # Calculate RSI
-        delta = df.groupby('market')['mid_price'].diff()
-        gain = delta.where(delta > 0, 0)
-        loss = (-delta).where(delta < 0, 0) # Ensure loss is positive
+        df = df.with_columns([
+            pl.col('price_delta').clip(lower_bound=0).alias('gain'),
+            (-pl.col('price_delta')).clip(lower_bound=0).alias('loss')
+        ])
         
-        # Calculate Wilder's EMA for average gain and loss
-        # adjust=False is crucial for Wilder's RSI.
-        # min_periods ensures that EMA starts after enough data.
-        avg_gain = gain.groupby(df['market']).transform(
-            lambda x: x.ewm(alpha=1/self.period, adjust=False, min_periods=self.period).mean()
+        df = df.with_columns([
+            pl.col('gain').ewm_mean(alpha=1/self.period, adjust=False).over('market').alias('avg_gain'),
+            pl.col('loss').ewm_mean(alpha=1/self.period, adjust=False).over('market').alias('avg_loss')
+        ])
+        
+        df = df.with_columns([
+            (pl.col('avg_gain') / pl.col('avg_loss')).alias('rs')
+        ])
+        
+        df = df.with_columns([
+            (100 - (100 / (1 + pl.col('rs')))).alias('rsi')
+        ])
+        
+        df = df.with_columns(
+            pl.col('rsi').shift(1).over('market').alias('prev_rsi')
         )
-        avg_loss = loss.groupby(df['market']).transform(
-            lambda x: x.ewm(alpha=1/self.period, adjust=False, min_periods=self.period).mean()
+        
+        df = df.with_columns([
+            ((pl.col('rsi') > self.oversold) & (pl.col('prev_rsi') <= self.oversold)).alias('entry_signal'),
+            ((pl.col('rsi') < self.overbought) & (pl.col('prev_rsi') >= self.overbought)).alias('exit_signal')
+        ])
+        
+        df = df.with_columns(
+            (abs(pl.col('rsi') - 50) * 2).clip(0, 100).alias('confidence')
         )
         
-        # Calculate Relative Strength (RS)
-        rs = np.zeros_like(avg_gain, dtype=float) # Initialize rs array
+        return df
 
-        # Case 1: avg_loss > 0
-        mask_loss_positive = avg_loss > 0
-        rs[mask_loss_positive] = avg_gain[mask_loss_positive] / avg_loss[mask_loss_positive]
-        
-        # Case 2: avg_loss == 0 and avg_gain > 0 (RSI should be 100)
-        # For RSI formula 100 - (100 / (1 + RS)), RS needs to be np.inf
-        mask_loss_zero_gain_pos = (avg_loss == 0) & (avg_gain > 0)
-        rs[mask_loss_zero_gain_pos] = np.inf
-        
-        # Case 3: avg_loss == 0 and avg_gain == 0 (RSI should be 50)
-        # For RSI formula, if RS = 1, then RSI = 100 - (100 / 2) = 50.
-        mask_both_zero = (avg_loss == 0) & (avg_gain == 0)
-        rs[mask_both_zero] = 1.0 # Results in RSI of 50
-
-        # Handle initial NaN periods from ewm if not covered (e.g. if avg_gain is NaN but avg_loss is not)
-        # This will make rs NaN for these periods.
-        rs[avg_gain.isna() | avg_loss.isna()] = np.nan
-
-        df['rsi'] = 100 - (100 / (1 + rs))
-        
-        # Generate signals
-        df['prev_rsi'] = df.groupby('market')['rsi'].shift(1)
-        df['entry_signal'] = (df['rsi'] > self.oversold) & (df['prev_rsi'] <= self.oversold)
-        df['exit_signal'] = (df['rsi'] < self.overbought) & (df['prev_rsi'] >= self.overbought)
-        
-        # Confidence score (0-100)
-        # abs(df['rsi'] - 50) gives distance from midline (0 to 50). Multiply by 2 to scale to 0-100.
-        df['confidence'] = abs(df['rsi'] - 50) * 2 
-        df['confidence'] = df['confidence'].clip(0, 100) # Ensure it's within [0,100]
-                                                        # NaNs in rsi will propagate to confidence.
-        
-        return df.set_index('ts_utc')
-
-    def plot_indicators(self, data: pd.DataFrame, market: str, min_confidence: float = 30) -> go.Figure:
-        market_data = data[data['market'] == market].copy()
-        if not isinstance(market_data.index, pd.DatetimeIndex):
-            market_data.index = pd.to_datetime(market_data.index)
+    def plot_indicators(self, data: pl.DataFrame, market: str, min_confidence: float = 30) -> go.Figure:
+        market_data = data.filter(pl.col('market') == market).to_pandas()
+        market_data['ts_utc'] = market_data['ts_utc'].dt.to_pydatetime()
+        market_data = market_data.set_index('ts_utc')
 
         fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1,
                             subplot_titles=(f'{market} Price', f'{market} RSI'))
         
-        # Price
         fig.add_trace(go.Scatter(x=market_data.index, y=market_data['mid_price'], name='Price', line=dict(color='blue')), 
                       row=1, col=1)
 
-        # Entry and Exit signals based on confidence
         entry_points = market_data[(market_data['entry_signal']) & (market_data['confidence'] >= min_confidence)]
         exit_points = market_data[(market_data['exit_signal']) & (market_data['confidence'] >= min_confidence)]
         
@@ -226,11 +202,9 @@ class RSIStrategy(TradingStrategy):
                                  marker=dict(color='red', size=10, symbol='triangle-down'), legendgroup='signals'), 
                       row=1, col=1)
         
-        # RSI
         fig.add_trace(go.Scatter(x=market_data.index, y=market_data['rsi'], name='RSI', line=dict(color='purple')), 
                       row=2, col=1)
         
-        # Overbought/Oversold lines
         fig.add_hline(y=self.overbought, line_dash="dash", line_color="red", annotation_text="Overbought", 
                       annotation_position="bottom right", row=2, col=1)
         fig.add_hline(y=self.oversold, line_dash="dash", line_color="green", annotation_text="Oversold", 
@@ -238,6 +212,80 @@ class RSIStrategy(TradingStrategy):
         
         fig.update_layout(height=700, title_text=f'{market} RSI Analysis', legend_title_text='Indicators')
         fig.update_yaxes(title_text="Price (USDT)", row=1, col=1)
-        fig.update_yaxes(title_text="RSI Value", row=2, col=1, range=[0, 100]) # RSI is 0-100
+        fig.update_yaxes(title_text="RSI Value", row=2, col=1, range=[0, 100])
         
+        return fig
+
+class GridStrategy(TradingStrategy):
+    def __init__(self, grid_size: float = 0.1, sma_fast: int = 20, sma_slow: int = 50, trend_threshold: float = 0.005):
+        self.grid_size = grid_size
+        self.sma_fast = sma_fast
+        self.sma_slow = sma_slow
+        self.trend_threshold = trend_threshold
+
+    def generate_signals(self, data: pl.DataFrame) -> pl.DataFrame:
+        # 1. Trend Filter
+        df = data.with_columns([
+            pl.col('mid_price').rolling_mean(self.sma_fast).over('market').alias('sma_fast'),
+            pl.col('mid_price').rolling_mean(self.sma_slow).over('market').alias('sma_slow')
+        ])
+        df = df.with_columns(
+            (abs(pl.col('sma_fast') - pl.col('sma_slow')) / pl.col('mid_price')).alias('trend_strength')
+        )
+        df = df.with_columns(
+            (pl.col('trend_strength') < self.trend_threshold).alias('is_ranging')
+        )
+
+        # 2. Grid Logic (centered on the slow SMA)
+        df = df.with_columns(
+            ((pl.col('mid_price') - pl.col('sma_slow')) / self.grid_size).floor().alias('grid_index')
+        )
+        df = df.with_columns(
+            pl.col('grid_index').shift(1).over('market').alias('prev_grid_index')
+        )
+
+        # 3. Generate Signals (Buy low, Sell high, only when ranging)
+        df = df.with_columns([
+            ((pl.col('grid_index') < pl.col('prev_grid_index')) & pl.col('is_ranging')).alias('entry_signal'), # Buy on drop
+            ((pl.col('grid_index') > pl.col('prev_grid_index')) & pl.col('is_ranging')).alias('exit_signal')   # Sell on rise
+        ])
+        
+        df = df.with_columns(
+            pl.lit(100).alias('confidence')
+        )
+        
+        return df
+
+    def plot_indicators(self, data: pl.DataFrame, market: str, min_confidence: float = 0) -> go.Figure:
+        market_data = data.filter(pl.col('market') == market).to_pandas()
+        market_data['ts_utc'] = market_data['ts_utc'].dt.to_pydatetime()
+        market_data = market_data.set_index('ts_utc')
+
+        market_data['entry_signal'] = market_data['entry_signal'].fillna(False)
+        market_data['exit_signal'] = market_data['exit_signal'].fillna(False)
+
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1,
+                            subplot_titles=(f'{market} Price and Signals', 'Trend Strength'))
+
+        # Plot price and SMAs
+        fig.add_trace(go.Scatter(x=market_data.index, y=market_data['mid_price'], name='Price', line=dict(color='blue')), row=1, col=1)
+        fig.add_trace(go.Scatter(x=market_data.index, y=market_data['sma_fast'], name=f'SMA ({self.sma_fast})', line=dict(color='orange', dash='dash')), row=1, col=1)
+        fig.add_trace(go.Scatter(x=market_data.index, y=market_data['sma_slow'], name=f'SMA ({self.sma_slow})', line=dict(color='purple', dash='dash')), row=1, col=1)
+
+        # Plot signals
+        entry_points = market_data[market_data['entry_signal']]
+        exit_points = market_data[market_data['exit_signal']]
+        
+        fig.add_trace(go.Scatter(x=entry_points.index, y=entry_points['mid_price'], mode='markers', name='Buy Signal', 
+                                 marker=dict(color='green', size=10, symbol='triangle-up')), row=1, col=1)
+        fig.add_trace(go.Scatter(x=exit_points.index, y=exit_points['mid_price'], mode='markers', name='Sell Signal', 
+                                 marker=dict(color='red', size=10, symbol='triangle-down')), row=1, col=1)
+
+        # Plot Trend Strength
+        fig.add_trace(go.Scatter(x=market_data.index, y=market_data['trend_strength'], name='Trend Strength', line=dict(color='grey')), row=2, col=1)
+        fig.add_hline(y=self.trend_threshold, line_dash="dash", line_color="red", annotation_text="Ranging Threshold", row=2, col=1)
+        
+        fig.update_layout(title=f'{market} Grid Strategy Analysis', height=700)
+        fig.update_yaxes(title_text="Price (USDT)", row=1, col=1)
+        fig.update_yaxes(title_text="Normalized Strength", row=2, col=1)
         return fig
