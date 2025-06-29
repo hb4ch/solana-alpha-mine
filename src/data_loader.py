@@ -1,119 +1,175 @@
 import os
 import polars as pl
-from typing import List
+from typing import List, Optional, Dict, Tuple
 import glob
-import json
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import partial
 import time
+import hashlib
+import pickle
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+# Import the C++ optimized L2 parser
+try:
+    from .fast_l2_parser_wrapper import parse_l2_levels_optimized, get_parser_stats, reset_parser_stats
+except ImportError:
+    from fast_l2_parser_wrapper import parse_l2_levels_optimized, get_parser_stats, reset_parser_stats
 
 logger = logging.getLogger(__name__)
 
-def parse_l2_levels_optimized(level_str: str) -> list:
-    """Optimized parsing of stringified list of lists for bid/ask levels."""
-    if level_str is None or level_str == "":
-        return []
-    
-    # Try JSON parsing first (faster than ast.literal_eval)
-    try:
-        # Handle cases where the string might already be in JSON format
-        if level_str.startswith('['):
-            return json.loads(level_str)
-        else:
-            # Fallback to ast.literal_eval for Python-specific formats
-            import ast
-            return ast.literal_eval(level_str)
-    except (ValueError, SyntaxError, json.JSONDecodeError):
-        logger.warning(f"Could not parse L2 level string: {level_str[:100]}...")
-        return []
+# Cache directory for parsed L2 data
+CACHE_DIR = Path("cache/l2_parsed")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-def parse_l2_levels(level_str: str) -> list:
-    """Legacy function - kept for backward compatibility."""
-    return parse_l2_levels_optimized(level_str)
+def get_cache_key(file_path: str, modification_time: float) -> str:
+    """Generate a cache key based on file path and modification time."""
+    key_string = f"{file_path}_{modification_time}"
+    return hashlib.md5(key_string.encode()).hexdigest()
 
-def load_single_file(file_info: tuple) -> pl.DataFrame:
+def load_single_file_with_cache(file_info: Tuple[str, str]) -> Optional[pl.DataFrame]:
     """
-    Load a single parquet file with error handling.
-    
-    Args:
-        file_info: tuple of (parquet_file_path, market)
-    
-    Returns:
-        DataFrame with market column added, or empty DataFrame on error
+    Load a single parquet file with intelligent caching for parsed L2 data.
+    Uses only the C++ optimized L2 parser.
     """
     parquet_file_path, market = file_info
     
     if not os.path.exists(parquet_file_path) or os.path.getsize(parquet_file_path) <= 12:
-        return pl.DataFrame()
+        return None
     
+    # Check cache first
+    mod_time = os.path.getmtime(parquet_file_path)
+    cache_key = get_cache_key(parquet_file_path, mod_time)
+    cache_file = CACHE_DIR / f"{cache_key}.pkl"
+    
+    if cache_file.exists():
+        try:
+            with open(cache_file, 'rb') as f:
+                df = pickle.load(f)
+                logger.debug(f"Loaded from cache: {parquet_file_path}")
+                return df
+        except Exception as e:
+            logger.warning(f"Cache read failed for {parquet_file_path}: {e}")
+    
+    # Load and process file
     try:
         df = pl.read_parquet(parquet_file_path)
         df = df.with_columns(pl.lit(market).alias('market'))
-        return df
-    except pl.exceptions.ComputeError as e:
-        logger.warning(f"Could not read Parquet file: {parquet_file_path}. Error: {e}")
-        return pl.DataFrame()
+        
+        # Parse L2 data using C++ optimized parser only
+        if 'bid_levels' in df.columns:
+            df = df.with_columns(
+                pl.col('bid_levels').map_elements(
+                    parse_l2_levels_optimized, 
+                    return_dtype=pl.List(pl.List(pl.Float64))
+                ).alias('bid_levels_parsed')
+            )
+        else:
+            df = df.with_columns(
+                pl.lit(None, dtype=pl.List(pl.List(pl.Float64))).alias('bid_levels_parsed')
+            )
 
-def load_all_market_data(base_path: str, markets: List[str], max_workers: int = None) -> pl.DataFrame:
+        if 'ask_levels' in df.columns:
+            df = df.with_columns(
+                pl.col('ask_levels').map_elements(
+                    parse_l2_levels_optimized, 
+                    return_dtype=pl.List(pl.List(pl.Float64))
+                ).alias('ask_levels_parsed')
+            )
+        else:
+            df = df.with_columns(
+                pl.lit(None, dtype=pl.List(pl.List(pl.Float64))).alias('ask_levels_parsed')
+            )
+        
+        # Cache the result
+        try:
+            with open(cache_file, 'wb') as f:
+                pickle.dump(df, f)
+            logger.debug(f"Cached processed data: {parquet_file_path}")
+        except Exception as e:
+            logger.warning(f"Cache write failed for {parquet_file_path}: {e}")
+        
+        return df
+        
+    except Exception as e:
+        logger.warning(f"Could not read/process Parquet file: {parquet_file_path}. Error: {e}")
+        return None
+
+def load_market_data_streaming(base_path: str, markets: List[str], 
+                              date_limit: Optional[int] = None,
+                              max_workers: int = None) -> pl.DataFrame:
     """
-    Load and concatenate all market data from partitioned Parquet files
-    for all available dates using Polars with parallel processing.
-    
-    Args:
-        base_path: Base path to the data directory
-        markets: List of market symbols to load
-        max_workers: Maximum number of worker threads (None for auto-detect)
-    
-    Returns:
-        Combined DataFrame with all market data
+    Streaming data loader that processes files in date order with memory optimization.
+    Uses only the C++ optimized L2 parser.
     """
     start_time = time.time()
     
-    # Collect all file paths that need to be loaded
+    # Collect and sort file tasks by date
     file_tasks = []
+    date_file_map = {}
+    
     for market in markets:
-        date_paths = glob.glob(os.path.join(base_path, f'market={market}', 'date=*'))
+        date_paths = sorted(glob.glob(os.path.join(base_path, f'market={market}', 'date=*')))
         for date_path in date_paths:
+            date_str = os.path.basename(date_path).replace('date=', '')
             parquet_file_path = os.path.join(date_path, 'enhanced_l2.parquet')
-            file_tasks.append((parquet_file_path, market))
+            
+            if date_str not in date_file_map:
+                date_file_map[date_str] = []
+            date_file_map[date_str].append((parquet_file_path, market))
     
-    logger.info(f"Found {len(file_tasks)} files to load across {len(markets)} markets")
+    # Process dates in order, optionally limiting number of dates
+    sorted_dates = sorted(date_file_map.keys())
+    if date_limit:
+        sorted_dates = sorted_dates[-date_limit:]  # Take most recent dates
     
-    if not file_tasks:
-        return pl.DataFrame()
+    logger.info(f"Processing {len(sorted_dates)} dates across {len(markets)} markets")
     
-    # Determine optimal number of workers
     if max_workers is None:
-        max_workers = min(len(file_tasks), os.cpu_count() or 4)
+        max_workers = min(os.cpu_count() or 4, 8)
     
     all_dfs = []
-    successful_loads = 0
+    total_files = sum(len(date_file_map[date]) for date in sorted_dates)
+    processed_files = 0
     
-    # Use ThreadPoolExecutor for I/O-bound parallel loading
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all tasks
-        future_to_task = {executor.submit(load_single_file, task): task for task in file_tasks}
+    # Process date by date to control memory usage
+    for date in sorted_dates:
+        date_files = date_file_map[date]
+        date_dfs = []
         
-        # Collect results as they complete
-        for future in as_completed(future_to_task):
-            try:
-                df = future.result()
-                if not df.is_empty():
-                    all_dfs.append(df)
-                    successful_loads += 1
-            except Exception as e:
-                task = future_to_task[future]
-                logger.error(f"Unexpected error loading {task[0]}: {e}")
+        # Process files for this date in parallel
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_task = {executor.submit(load_single_file_with_cache, task): task for task in date_files}
+            
+            for future in as_completed(future_to_task):
+                try:
+                    df = future.result()
+                    if df is not None and not df.is_empty():
+                        date_dfs.append(df)
+                    processed_files += 1
+                except Exception as e:
+                    task = future_to_task[future]
+                    logger.error(f"Error loading {task[0]}: {e}")
+                    processed_files += 1
+        
+        # Combine data for this date
+        if date_dfs:
+            date_combined = pl.concat(date_dfs)
+            all_dfs.append(date_combined)
+            logger.info(f"Processed date {date}: {len(date_dfs)} files, {date_combined.shape[0]} rows")
+        
+        # Clean up to free memory
+        del date_dfs
     
     load_time = time.time() - start_time
-    logger.info(f"Parallel loading completed: {successful_loads}/{len(file_tasks)} files loaded in {load_time:.2f} seconds")
+    logger.info(f"Streaming loading completed: {processed_files}/{total_files} files in {load_time:.2f} seconds")
     
     if not all_dfs:
         return pl.DataFrame()
 
-    # Concatenate all DataFrames
+    # Final concatenation and processing
+    logger.info("Final concatenation and timestamp processing...")
     concat_start = time.time()
+    
     combined_df = pl.concat(all_dfs)
     
     # Convert timestamp and sort
@@ -123,204 +179,101 @@ def load_all_market_data(base_path: str, markets: List[str], max_workers: int = 
     combined_df = combined_df.sort('ts_utc')
     
     concat_time = time.time() - concat_start
-    logger.info(f"Data concatenation and sorting completed in {concat_time:.2f} seconds")
+    logger.info(f"Final processing completed in {concat_time:.2f} seconds")
     
     return combined_df
 
-def parse_l2_chunk(chunk: pl.DataFrame) -> pl.DataFrame:
-    """
-    Parse L2 data for a single chunk.
-    """
-    if 'bid_levels' in chunk.columns:
-        chunk = chunk.with_columns(
-            pl.col('bid_levels').map_elements(
-                parse_l2_levels_optimized, 
-                return_dtype=pl.List(pl.List(pl.Float64))
-            ).alias('bid_levels_parsed')
-        )
-    else:
-        chunk = chunk.with_columns(
-            pl.lit(None, dtype=pl.List(pl.List(pl.Float64))).alias('bid_levels_parsed')
-        )
+def clear_cache():
+    """Clear the L2 parsing cache."""
+    try:
+        for cache_file in CACHE_DIR.glob("*.pkl"):
+            cache_file.unlink()
+        logger.info("L2 parsing cache cleared")
+    except Exception as e:
+        logger.error(f"Error clearing cache: {e}")
 
-    if 'ask_levels' in chunk.columns:
-        chunk = chunk.with_columns(
-            pl.col('ask_levels').map_elements(
-                parse_l2_levels_optimized, 
-                return_dtype=pl.List(pl.List(pl.Float64))
-            ).alias('ask_levels_parsed')
-        )
-    else:
-        chunk = chunk.with_columns(
-            pl.lit(None, dtype=pl.List(pl.List(pl.Float64))).alias('ask_levels_parsed')
-        )
-    
-    return chunk
+def get_cache_stats() -> Dict[str, int]:
+    """Get cache statistics."""
+    try:
+        cache_files = list(CACHE_DIR.glob("*.pkl"))
+        total_size = sum(f.stat().st_size for f in cache_files)
+        return {
+            "files": len(cache_files),
+            "total_size_mb": total_size / (1024 * 1024)
+        }
+    except Exception:
+        return {"files": 0, "total_size_mb": 0}
 
-def parse_l2_parallel_chunks(df: pl.DataFrame, chunk_size: int = 50000, max_workers: int = None) -> pl.DataFrame:
+def load_and_preprocess_raw_data(base_path: str, markets: List[str], 
+                                date_limit: Optional[int] = None,
+                                max_workers: Optional[int] = None) -> pl.DataFrame:
     """
-    Parse L2 data using parallel processing with chunked data.
-    """
-    parsing_start = time.time()
-    
-    if max_workers is None:
-        max_workers = min(os.cpu_count() or 4, 8)  # Cap at 8 workers to avoid memory issues
-    
-    total_rows = df.shape[0]
-    chunks = []
-    
-    # Split DataFrame into chunks
-    for i in range(0, total_rows, chunk_size):
-        chunk = df.slice(i, min(chunk_size, total_rows - i))
-        chunks.append(chunk)
-    
-    logger.info(f"Processing L2 parsing in {len(chunks)} chunks using {max_workers} workers")
-    
-    parsed_chunks = []
-    
-    # Process chunks in parallel
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all chunk parsing tasks
-        future_to_chunk = {executor.submit(parse_l2_chunk, chunk): i for i, chunk in enumerate(chunks)}
-        
-        # Collect results as they complete
-        for future in as_completed(future_to_chunk):
-            chunk_idx = future_to_chunk[future]
-            try:
-                parsed_chunk = future.result()
-                parsed_chunks.append((chunk_idx, parsed_chunk))
-            except Exception as e:
-                logger.error(f"Error parsing chunk {chunk_idx}: {e}")
-                # Add the original chunk without parsing as fallback
-                parsed_chunks.append((chunk_idx, chunks[chunk_idx]))
-    
-    # Sort by original chunk order and concatenate
-    parsed_chunks.sort(key=lambda x: x[0])
-    result_chunks = [chunk for _, chunk in parsed_chunks]
-    
-    if result_chunks:
-        result_df = pl.concat(result_chunks)
-    else:
-        result_df = df
-    
-    parsing_time = time.time() - parsing_start
-    logger.info(f"Parallel L2 parsing completed in {parsing_time:.2f} seconds")
-    
-    return result_df
-
-def parse_l2_vectorized(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    Vectorized L2 parsing using Polars lazy evaluation for better performance.
-    """
-    parsing_start = time.time()
-    
-    # Use lazy DataFrame for deferred execution and optimization
-    lazy_df = df.lazy()
-    
-    # Parse L2 order book data with optimized operations
-    if 'bid_levels' in df.columns:
-        lazy_df = lazy_df.with_columns(
-            pl.col('bid_levels').map_elements(
-                parse_l2_levels_optimized, 
-                return_dtype=pl.List(pl.List(pl.Float64))
-            ).alias('bid_levels_parsed')
-        )
-    else:
-        logger.warning("Column 'bid_levels' not found.")
-        lazy_df = lazy_df.with_columns(
-            pl.lit(None, dtype=pl.List(pl.List(pl.Float64))).alias('bid_levels_parsed')
-        )
-
-    if 'ask_levels' in df.columns:
-        lazy_df = lazy_df.with_columns(
-            pl.col('ask_levels').map_elements(
-                parse_l2_levels_optimized, 
-                return_dtype=pl.List(pl.List(pl.Float64))
-            ).alias('ask_levels_parsed')
-        )
-    else:
-        logger.warning("Column 'ask_levels' not found.")
-        lazy_df = lazy_df.with_columns(
-            pl.lit(None, dtype=pl.List(pl.List(pl.Float64))).alias('ask_levels_parsed')
-        )
-    
-    # Materialize the lazy DataFrame
-    result_df = lazy_df.collect()
-    
-    parsing_time = time.time() - parsing_start
-    logger.info(f"L2 parsing completed in {parsing_time:.2f} seconds")
-    
-    return result_df
-
-def load_and_preprocess_raw_data(base_path: str, markets: list, use_parallel_chunks: bool = True, 
-                                  use_lazy: bool = True, chunk_size: int = 50000) -> pl.DataFrame:
-    """
-    Loads raw data and performs initial parsing for L2 order book with optimizations.
+    Unified data loader with C++ optimized L2 parsing, streaming, and caching.
     
     Args:
         base_path: Base path to the data directory
         markets: List of market symbols to load
-        use_parallel_chunks: Whether to use parallel chunked processing for L2 parsing
-        use_lazy: Whether to use lazy evaluation for L2 parsing (only used if use_parallel_chunks=False)
-        chunk_size: Size of chunks for parallel processing
+        date_limit: Limit number of most recent dates to process (None for all)
+        max_workers: Maximum number of worker threads
     
     Returns:
-        Combined DataFrame with parsed L2 data
+        Combined DataFrame with C++ optimized L2 parsing
     """
     total_start = time.time()
-    logger.info(f"Loading and preprocessing raw data for markets: {markets} from {base_path}")
+    logger.info(f"Loading data with C++ optimized L2 parsing: markets={markets}")
     
-    df_combined = load_all_market_data(base_path=base_path, markets=markets)
+    df_combined = load_market_data_streaming(
+        base_path=base_path, 
+        markets=markets, 
+        date_limit=date_limit,
+        max_workers=max_workers
+    )
     
     if df_combined.is_empty():
-        logger.error("No data loaded. Exiting.")
+        logger.error("No data loaded.")
         return pl.DataFrame()
 
-    logger.info(f"Loaded combined data shape: {df_combined.shape}")
-
-    # Parse L2 order book data with optimization
-    logger.info("Parsing L2 order book data (bid_levels, ask_levels)...")
-    
-    if use_parallel_chunks and df_combined.shape[0] > chunk_size:
-        # Use parallel chunked processing for large datasets
-        df_combined = parse_l2_parallel_chunks(df_combined, chunk_size=chunk_size)
-    elif use_lazy:
-        # Use lazy evaluation for medium datasets
-        df_combined = parse_l2_vectorized(df_combined)
-    else:
-        # Fallback to original parsing method for small datasets
-        if 'bid_levels' in df_combined.columns:
-            df_combined = df_combined.with_columns(
-                pl.col('bid_levels').map_elements(parse_l2_levels, return_dtype=pl.List(pl.List(pl.Float64))).alias('bid_levels_parsed')
-            )
-        else:
-            logger.warning("Column 'bid_levels' not found.")
-            df_combined = df_combined.with_columns(pl.lit(None, dtype=pl.List(pl.List(pl.Float64))).alias('bid_levels_parsed'))
-
-        if 'ask_levels' in df_combined.columns:
-            df_combined = df_combined.with_columns(
-                pl.col('ask_levels').map_elements(parse_l2_levels, return_dtype=pl.List(pl.List(pl.Float64))).alias('ask_levels_parsed')
-            )
-        else:
-            logger.warning("Column 'ask_levels' not found.")
-            df_combined = df_combined.with_columns(pl.lit(None).alias('ask_levels_parsed'))
-    
     total_time = time.time() - total_start
-    logger.info(f"Total data loading and preprocessing completed in {total_time:.2f} seconds")
+    logger.info(f"C++ optimized loading completed in {total_time:.2f} seconds")
+    logger.info(f"Final dataset shape: {df_combined.shape}")
+    
+    # Log cache statistics
+    cache_stats = get_cache_stats()
+    logger.info(f"Cache: {cache_stats['files']} files, {cache_stats['total_size_mb']:.1f} MB")
+    
+    # Log C++ parser statistics
+    parser_stats = get_parser_stats()
+    if parser_stats.get('cpp_parser_available'):
+        logger.info(f"C++ Parser Stats: {parser_stats.get('success_rate', 0):.1f}% success rate, "
+                   f"{parser_stats.get('total_parsed', 0)} total parsed")
     
     return df_combined
 
 if __name__ == "__main__":
-    # Example usage
+    # Test the unified loader
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    
+    print("Testing unified C++ optimized data loader...")
     df = load_and_preprocess_raw_data(
         base_path='crypto_tick',
-        markets=['BTC_USDT', 'ETH_USDT', 'SOL_USDT', 'BNB_USDT']
+        markets=['BTC_USDT', 'ETH_USDT', 'SOL_USDT', 'BNB_USDT'],
+        date_limit=3  # Test with just 3 most recent dates
     )
+    
     if not df.is_empty():
-        print(f"Loaded data with shape: {df.shape}")
-        print(df.head())
-        print("\nData loaded for markets:", df['market'].unique().to_list())
-        print("Date range:", df['ts_utc'].min(), "to", df['ts_utc'].max())
-        print("Parsed columns check:", 'bid_levels_parsed' in df.columns)
+        print(f"✅ Loaded data with shape: {df.shape}")
+        print(f"Markets: {df['market'].unique().to_list()}")
+        print(f"Date range: {df['ts_utc'].min()} to {df['ts_utc'].max()}")
+        print(f"L2 parsing check: bid_levels_parsed={('bid_levels_parsed' in df.columns)}, ask_levels_parsed={('ask_levels_parsed' in df.columns)}")
+        
+        # Show sample of parsed data
+        if 'bid_levels_parsed' in df.columns:
+            sample_bid = df.select('bid_levels_parsed').head(1).item(0, 0)
+            print(f"Sample bid levels: {sample_bid}")
     else:
-        print("No data loaded.")
+        print("❌ No data loaded")

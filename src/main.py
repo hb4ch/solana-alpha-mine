@@ -3,8 +3,7 @@ import plotly.express as px
 import argparse
 import os
 import logging
-from data_loader import load_and_preprocess_raw_data
-from data_loader_v2 import load_and_preprocess_raw_data_v2, clear_cache
+from data_loader import load_and_preprocess_raw_data, clear_cache
 
 from backtest import GenericBacktester
 from strategies import MACDStrategy, RSIStrategy, MovingAverageCrossover, GridStrategy
@@ -25,19 +24,49 @@ STRATEGY_CONFIG = {
     'mac': (MovingAverageCrossover, {'fast_window': 10, 'slow_window': 30}),
     'grid': (GridStrategy, {'grid_size': 0.5, 'sma_fast': 20, 'sma_slow': 50, 'trend_threshold': 0.001}),
     'ml': (MLTradingStrategy, {
-        'model_path': os.path.join(MODELS_DIR, f"{TARGET_MARKET}_lgbm_model.joblib"),
-        'scaler_path': os.path.join(MODELS_DIR, f"{TARGET_MARKET}_scaler.joblib"),
-        'features_path': os.path.join(MODELS_DIR, f"{TARGET_MARKET}_features.joblib"),
-        'prediction_threshold': 0.6, 'tp_pct': 0.008, 'sl_pct': 0.005,
-        'horizon_seconds': 60 * 30
+        'model_path': os.path.join(MODELS_DIR, f"{TARGET_MARKET}_quantile_model.pth"),
+        'scaler_path': os.path.join(MODELS_DIR, f"{TARGET_MARKET}_quantile_scaler.joblib"),
+        'features_path': os.path.join(MODELS_DIR, f"{TARGET_MARKET}_quantile_features.joblib"),
+        'confidence_threshold': 0.3, 'tp_pct': 0.008, 'sl_pct': 0.005,
+        'horizon_seconds': 60 * 60  # 1 hour for neural network
     })
 }
+# Updated features list to match the refactored features.py output
 BASE_FEATURES = [
-    'wap', 'obi_level5', 'bid_depth_level5', 'ask_depth_level5', 'rsi_7', 'rsi_14', 'rsi_21',
-    'rsi_overbought', 'rsi_oversold', 'rsi_momentum', 'rsi_ema_9', 'macd_line', 'macd_histogram',
-    'volume_1m_sma20', 'spread_abs_sma20', 'volatility_20p', 'sol_vs_btc_price_ratio',
-    'sol_vs_eth_price_ratio', 'sol_vs_bnb_price_ratio', 'btc_return_lag1', 'eth_return_lag1',
-    'bnb_return_lag1', 'hour_sin', 'hour_cos', 'day_sin', 'day_cos'
+    # L2 Order Book Features
+    'bid_depth_total', 'ask_depth_total', 'spread_abs_calc', 'spread_rel_calc', 
+    'wap', 'obi_total',
+    
+    # Technical Indicators
+    'rsi_7', 'rsi_14', 'rsi_21', 'rsi_30',
+    'rsi_overbought', 'rsi_oversold', 'rsi_momentum', 'rsi_ema_9',
+    'rsi_overbought_flag', 'rsi_oversold_flag',
+    'macd_line', 'macd_signal_line', 'macd_histogram',
+    'bb_upper', 'bb_lower', 'bb_width', 'bb_position',
+    'stoch_k', 'williams_r', 'cci', 'atr',
+    
+    # Volume & Volatility Features
+    'volume_sma_20', 'volume_std_20', 'volume_change', 'volume_ratio',
+    'volatility_20p', 'volatility_60p', 'spread_rel_sma_20', 'spread_rel_std_20',
+    'returns_1p', 'returns_5p', 'returns_20p', 'sharpe_20p',
+    
+    # Advanced Order Book Features
+    'size_imbalance_l1', 'size_imbalance_l2', 'size_imbalance_l3',
+    'value_imbalance_l1', 'value_imbalance_l2', 'value_imbalance_l3',
+    'bid_slope', 'ask_slope', 'bid_vwap_3l', 'ask_vwap_3l',
+    'bid_price_stability', 'ask_price_stability',
+    
+    # Microstructure Features
+    'price_direction', 'uptick_flag', 'obi_change', 'obi_trend',
+    'spread_change', 'spread_trend',
+    
+    # Cross-Market Features (if available)
+    'sol_btc_ratio', 'sol_eth_ratio', 'sol_bnb_ratio',
+    'btc_return_1p', 'eth_return_1p', 'bnb_return_1p',
+    
+    # Time Features
+    'hour_sin', 'hour_cos', 'day_sin', 'day_cos', 'minute_sin', 'minute_cos',
+    'asian_session', 'european_session', 'us_session'
 ]
 
 def parse_args():
@@ -49,11 +78,11 @@ def parse_args():
     
     # Risk management parameters
     parser.add_argument('--max_position_pct', type=float, default=0.15, 
-                        help='Maximum position size as percentage of portfolio (default: 15%)')
+                        help='Maximum position size as percentage of portfolio (default: 15%%)')
     parser.add_argument('--max_exposure_pct', type=float, default=0.80,
-                        help='Maximum total exposure as percentage of portfolio (default: 80%)')
+                        help='Maximum total exposure as percentage of portfolio (default: 80%%)')
     parser.add_argument('--min_cash_pct', type=float, default=0.20,
-                        help='Minimum cash reserve as percentage of portfolio (default: 20%)')
+                        help='Minimum cash reserve as percentage of portfolio (default: 20%%)')
     parser.add_argument('--max_positions', type=int, default=5,
                         help='Maximum number of concurrent positions (default: 5)')
     
@@ -75,9 +104,8 @@ def main():
         print("--- Skipping training, using existing model files. ---")
 
     print(f"\n=== Starting Backtest for {args.strategy.upper()} Strategy ===")
-    # raw_data = load_and_preprocess_raw_data(base_path=DATA_PATH, markets=MARKETS_TO_LOAD)
-    # clear_cache()
-    raw_data = load_and_preprocess_raw_data_v2(base_path=DATA_PATH, markets=MARKETS_TO_LOAD)
+    clear_cache()
+    raw_data = load_and_preprocess_raw_data(base_path=DATA_PATH, markets=MARKETS_TO_LOAD)
     if raw_data.is_empty():
         print("No data loaded for backtesting. Exiting.")
         return
@@ -85,7 +113,7 @@ def main():
     print(f"Loaded {len(raw_data)} records across {raw_data['market'].n_unique()} markets.")
     
     if args.strategy == 'ml':
-        strategy_params['prediction_threshold'] = args.confidence
+        strategy_params['confidence_threshold'] = args.confidence
 
     # Configure risk management
     risk_config = RiskConfig(

@@ -2,14 +2,16 @@ import polars as pl
 import numpy as np
 import joblib
 import os
-from sklearn.model_selection import train_test_split, TimeSeriesSplit, RandomizedSearchCV
 from sklearn.preprocessing import StandardScaler
-import lightgbm as lgb
-from sklearn.metrics import classification_report, roc_auc_score
-from scipy.stats import uniform, randint
-from data_loader import load_and_preprocess_raw_data
+from sklearn.metrics import classification_report
+try:
+    from .data_loader import load_and_preprocess_raw_data
+except ImportError:
+    from data_loader import load_and_preprocess_raw_data
 from features import engineer_features
+from neural_network import QuantileTrainer, load_quantile_model
 import logging
+import torch
 
 LOGS_DIR = "logs"
 MODELS_DIR = "models"
@@ -27,135 +29,363 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def generate_target_variable(df: pl.DataFrame, market_to_predict: str = 'SOL_USDT',
-                             horizon_seconds: int = 3600,
-                             tp_pct: float = 0.004, sl_pct: float = 0.002) -> pl.DataFrame:
-    logger.info(f"Generating target variable for {market_to_predict} with {horizon_seconds}s horizon...")
-    
-    df_market = df.filter(pl.col('market') == market_to_predict)
-    if df_market.is_empty():
-        logger.warning(f"No data for {market_to_predict} to generate labels.")
-        return df
-
-    time_diffs = df_market['ts_utc'].diff().median()
-    ticks_per_second = 1 / (time_diffs.total_seconds() if time_diffs else 5)
-    horizon_steps = int(horizon_seconds * ticks_per_second) or 1
-
-    df_market = df_market.with_columns([
-        (pl.col('mid_price') * (1 + tp_pct)).alias('tp_price'),
-        (pl.col('mid_price') * (1 - sl_pct)).alias('sl_price')
-    ])
-
-    rolling_max_price = pl.col('mid_price').rolling_max(window_size=horizon_steps).shift(-horizon_steps + 1)
-    rolling_min_price = pl.col('mid_price').rolling_min(window_size=horizon_steps).shift(-horizon_steps + 1)
-
-    tp_hit = rolling_max_price >= pl.col('tp_price')
-    sl_hit = rolling_min_price <= pl.col('sl_price')
-
-    df_market = df_market.with_columns(
-        pl.when(tp_hit & ~sl_hit).then(1).otherwise(0).alias('label')
-    )
-
-    logger.info(f"Target variable generation complete. Label distribution:\n{df_market['label'].value_counts()}")
-    
-    return df.join(df_market.select(['ts_utc', 'market', 'label']), on=['ts_utc', 'market'], how='left').with_columns(pl.col('label').fill_null(-1))
-
-def train_model(df: pl.DataFrame, features_list: list, target_col: str = 'label',
-                market_to_predict: str = 'SOL_USDT'):
-    logger.info("Starting model training...")
-
-    df_train_val = df.filter((pl.col('market') == market_to_predict) & (pl.col(target_col) != -1)).drop_nulls(subset=features_list + [target_col])
-
-    if df_train_val.is_empty() or df_train_val['label'].n_unique() < 2:
-        logger.error(f"Not enough data or classes for {market_to_predict} to train.")
-        return None, None
-
-    X = df_train_val.select(features_list)
-    y = df_train_val[target_col]
-
-    X_dev, X_holdout_test, y_dev, y_holdout_test = train_test_split(X, y, test_size=0.20, shuffle=False)
-    
-    logger.info(f"Development set size: {X_dev.shape}, Hold-out Test set size: {X_holdout_test.shape}")
-
-    scaler = StandardScaler()
-    X_dev_scaled = scaler.fit_transform(X_dev.to_numpy())
-
-    param_dist = {
-        'n_estimators': randint(50, 200), 'learning_rate': uniform(0.01, 0.1),
-        'num_leaves': randint(20, 50), 'max_depth': [-1, 10, 20, 30],
-        'min_child_samples': randint(20, 100), 'subsample': uniform(0.7, 0.3),
-        'colsample_bytree': uniform(0.7, 0.3)
+def get_default_model_config():
+    """Get default neural network configuration"""
+    return {
+        'hidden_dims': [512, 256, 128, 64],
+        'num_classes': 10,
+        'dropout_rate': 0.4,
+        'learning_rate': 0.001,
+        'batch_size': 1024,
+        'epochs': 100,
+        'patience': 15
     }
 
-    random_search = RandomizedSearchCV(
-        estimator=lgb.LGBMClassifier(random_state=42, class_weight='balanced', 
-                                     n_jobs=-1, device='gpu'),
-        param_distributions=param_dist, n_iter=10, cv=TimeSeriesSplit(n_splits=3),
-        scoring='roc_auc', verbose=2, n_jobs=-1, random_state=42
-    )
+def train_quantile_model(df: pl.DataFrame, features_list: list,
+                        market_to_predict: str = 'SOL_USDT',
+                        horizon_seconds: int = 3600,
+                        model_config: dict = None):
+    """
+    Train a neural network for quantile prediction
     
-    random_search.fit(X_dev_scaled, y_dev.to_numpy())
-
-    logger.info(f"Best parameters for LGBM: {random_search.best_params_}")
-    logger.info(f"Best AUC from RandomizedSearchCV (LGBM): {random_search.best_score_:.4f}")
-
-    final_model = random_search.best_estimator_
-    X_holdout_test_scaled = scaler.transform(X_holdout_test.to_numpy())
+    Args:
+        df: DataFrame with market data and features
+        features_list: List of feature column names to use
+        market_to_predict: Market symbol to predict
+        horizon_seconds: Prediction horizon in seconds
+        model_config: Neural network configuration dict
+        
+    Returns:
+        Trained model, scaler, and training results
+    """
+    logger.info("Starting neural network quantile training...")
     
-    test_preds_proba = final_model.predict_proba(X_holdout_test_scaled)[:, 1]
-    test_preds_label = final_model.predict(X_holdout_test_scaled)
+    if model_config is None:
+        model_config = get_default_model_config()
     
-    logger.info("Hold-out Test Set Performance:")
-    logger.info(f"\n{classification_report(y_holdout_test.to_numpy(), test_preds_label)}")
+    # Initialize trainer
+    trainer = QuantileTrainer(model_config)
+    
+    # Prepare data
     try:
-        logger.info(f"Hold-out Test AUC: {roc_auc_score(y_holdout_test.to_numpy(), test_preds_proba):.4f}")
-    except ValueError as e:
-        logger.warning(f"Could not calculate AUC for hold-out test set: {e}")
-
-    model_filename = os.path.join(MODELS_DIR, f"{market_to_predict}_lgbm_model.joblib")
-    scaler_filename = os.path.join(MODELS_DIR, f"{market_to_predict}_scaler.joblib")
-    features_filename = os.path.join(MODELS_DIR, f"{market_to_predict}_features.joblib")
+        X, y_returns, valid_mask = trainer.prepare_data(
+            df, features_list, market_to_predict, horizon_seconds
+        )
+    except Exception as e:
+        logger.error(f"Error preparing data: {e}")
+        return None, None, None
     
-    joblib.dump(final_model, model_filename)
-    joblib.dump(scaler, scaler_filename)
-    joblib.dump(features_list, features_filename)
+    # Train model
+    try:
+        training_results = trainer.train_model(X, y_returns, valid_mask)
+    except Exception as e:
+        logger.error(f"Error training model: {e}")
+        return None, None, None
     
-    logger.info(f"Model, scaler, and feature list saved.")
+    # Save model files
+    model_filename = os.path.join(MODELS_DIR, f"{market_to_predict}_quantile_model.pth")
+    scaler_filename = os.path.join(MODELS_DIR, f"{market_to_predict}_quantile_scaler.joblib")
+    config_filename = os.path.join(MODELS_DIR, f"{market_to_predict}_quantile_config.joblib")
+    features_filename = os.path.join(MODELS_DIR, f"{market_to_predict}_quantile_features.joblib")
+    
+    try:
+        trainer.save_model(model_filename, scaler_filename, config_filename)
+        joblib.dump(features_list, features_filename)
+        logger.info(f"Model files saved successfully")
+    except Exception as e:
+        logger.error(f"Error saving model: {e}")
+        return None, None, None
+    
+    return trainer.model, trainer.scaler, training_results
 
-    return final_model, scaler
+def evaluate_quantile_model(model_path: str, scaler_path: str, features_path: str,
+                           df: pl.DataFrame, market_to_predict: str = 'SOL_USDT',
+                           horizon_seconds: int = 3600):
+    """
+    Evaluate a trained quantile model
+    
+    Args:
+        model_path: Path to saved model
+        scaler_path: Path to saved scaler
+        features_path: Path to saved features list
+        df: DataFrame with market data
+        market_to_predict: Market to evaluate on
+        horizon_seconds: Prediction horizon
+        
+    Returns:
+        Evaluation results dictionary
+    """
+    logger.info("Evaluating quantile model...")
+    
+    try:
+        # Load model and components
+        model, scaler, model_info = load_quantile_model(model_path, scaler_path)
+        features_list = joblib.load(features_path)
+        
+        # Prepare evaluation data
+        trainer = QuantileTrainer(model_info['config'])
+        X, y_returns, valid_mask = trainer.prepare_data(
+            df, features_list, market_to_predict, horizon_seconds
+        )
+        
+        # Filter valid samples
+        X_valid = X[valid_mask]
+        y_valid = y_returns[valid_mask]
+        
+        if len(X_valid) < 100:
+            logger.warning(f"Insufficient evaluation samples: {len(X_valid)}")
+            return None
+        
+        # Use last 20% as test set
+        test_idx = int(len(X_valid) * 0.8)
+        X_test = X_valid[test_idx:]
+        y_test = y_valid[test_idx:]
+        
+        # Create quantile targets for evaluation
+        y_quantiles_test, _ = trainer.create_quantile_targets(y_test, n_quantiles=10)
+        
+        # Scale features
+        X_test_scaled = scaler.transform(X_test)
+        
+        # Make predictions
+        device = next(model.parameters()).device
+        X_test_tensor = torch.FloatTensor(X_test_scaled).to(device)
+        
+        with torch.no_grad():
+            probs, predicted_quantiles, max_probs = model.predict_quantiles(X_test_tensor)
+            
+        # Convert to numpy
+        probs_np = probs.cpu().numpy()
+        predicted_quantiles_np = predicted_quantiles.cpu().numpy()
+        max_probs_np = max_probs.cpu().numpy()
+        
+        # Calculate metrics
+        accuracy = np.mean(predicted_quantiles_np == y_quantiles_test)
+        
+        # Calculate per-quantile accuracies
+        quantile_accuracies = {}
+        for i in range(10):
+            mask = y_quantiles_test == i
+            if np.sum(mask) > 0:
+                quantile_accuracies[f'quantile_{i}'] = np.mean(
+                    predicted_quantiles_np[mask] == y_quantiles_test[mask]
+                )
+        
+        # Generate trading signals for evaluation
+        buy_signals = predicted_quantiles_np == 9  # Highest quantile
+        sell_signals = predicted_quantiles_np == 0  # Lowest quantile
+        
+        # Calculate signal statistics
+        n_buy_signals = np.sum(buy_signals)
+        n_sell_signals = np.sum(sell_signals)
+        avg_buy_confidence = np.mean(max_probs_np[buy_signals]) if n_buy_signals > 0 else 0
+        avg_sell_confidence = np.mean(max_probs_np[sell_signals]) if n_sell_signals > 0 else 0
+        
+        results = {
+            'overall_accuracy': accuracy * 100,
+            'quantile_accuracies': quantile_accuracies,
+            'n_test_samples': len(X_test),
+            'n_buy_signals': n_buy_signals,
+            'n_sell_signals': n_sell_signals,
+            'avg_buy_confidence': avg_buy_confidence,
+            'avg_sell_confidence': avg_sell_confidence,
+            'signal_rate': (n_buy_signals + n_sell_signals) / len(X_test) * 100
+        }
+        
+        logger.info("Model evaluation completed:")
+        logger.info(f"  Overall accuracy: {accuracy*100:.2f}%")
+        logger.info(f"  Buy signals: {n_buy_signals} ({n_buy_signals/len(X_test)*100:.1f}%)")
+        logger.info(f"  Sell signals: {n_sell_signals} ({n_sell_signals/len(X_test)*100:.1f}%)")
+        logger.info(f"  Avg buy confidence: {avg_buy_confidence:.3f}")
+        logger.info(f"  Avg sell confidence: {avg_sell_confidence:.3f}")
+        
+        return results
+        
+    except Exception as e:
+        logger.error(f"Error evaluating model: {e}")
+        return None
 
 def run_training_pipeline(markets_to_load: list, target_market: str,
                           features_list: list,
-                          tp_pct: float, sl_pct: float, training_horizon_seconds: int):
-    logger.info("Starting ML training pipeline...")
-
+                          tp_pct: float = 0.004, sl_pct: float = 0.002, 
+                          training_horizon_seconds: int = 3600,
+                          model_config: dict = None):
+    """
+    Run the complete neural network training pipeline
+    
+    Args:
+        markets_to_load: List of markets to load data for
+        target_market: Market to predict
+        features_list: List of feature names
+        tp_pct: Take profit percentage (not used in quantile model but kept for compatibility)
+        sl_pct: Stop loss percentage (not used in quantile model but kept for compatibility)
+        training_horizon_seconds: Prediction horizon in seconds
+        model_config: Neural network configuration
+    """
+    logger.info("Starting neural network training pipeline...")
+    
+    # Load and preprocess data
     df_raw = load_and_preprocess_raw_data(base_path=DATA_BASE_PATH, markets=markets_to_load)
     if df_raw.is_empty():
+        logger.error("No data loaded. Exiting.")
         return
-
+    
+    # Engineer features
     df_featured = engineer_features(df_raw)
     
-    final_features_to_use = features_list + [col for col in df_featured.columns if col.startswith(('phase_', 'volregime_')) and col not in features_list]
+    # Include regime and phase features
+    final_features_to_use = features_list + [
+        col for col in df_featured.columns 
+        if col.startswith(('phase_', 'volregime_')) and col not in features_list
+    ]
     final_features_to_use = [f for f in final_features_to_use if f in df_featured.columns]
-    logger.info(f"Final features for training: {final_features_to_use}")
+    logger.info(f"Final features for training: {len(final_features_to_use)} features")
     
+    # Drop rows with missing feature values
     df_processed = df_featured.drop_nulls(subset=final_features_to_use)
     if df_processed.is_empty():
         logger.error("DataFrame empty after feature engineering and NaN drop.")
         return
-
-    df_final = generate_target_variable(
-        df_processed, market_to_predict=target_market,
-        horizon_seconds=training_horizon_seconds, tp_pct=tp_pct, sl_pct=sl_pct
+    
+    # Check if target market has sufficient data
+    target_data = df_processed.filter(pl.col('market') == target_market)
+    if target_data.is_empty() or len(target_data) < 10000:
+        logger.error(f"Insufficient data for {target_market}. Need at least 10000 samples.")
+        return
+    
+    logger.info(f"Training data size for {target_market}: {len(target_data)} samples")
+    
+    # Train quantile model
+    model, scaler, training_results = train_quantile_model(
+        df_processed, 
+        features_list=final_features_to_use,
+        market_to_predict=target_market,
+        horizon_seconds=training_horizon_seconds,
+        model_config=model_config
     )
     
-    if 'label' not in df_final.columns or df_final.filter(pl.col('market') == target_market)['label'].is_in([0, 1]).sum() == 0:
-        logger.error(f"No valid labels for {target_market}. Exiting.")
+    if model is None:
+        logger.error("Model training failed")
         return
+    
+    # Evaluate model
+    model_path = os.path.join(MODELS_DIR, f"{target_market}_quantile_model.pth")
+    scaler_path = os.path.join(MODELS_DIR, f"{target_market}_quantile_scaler.joblib")
+    features_path = os.path.join(MODELS_DIR, f"{target_market}_quantile_features.joblib")
+    
+    eval_results = evaluate_quantile_model(
+        model_path, scaler_path, features_path,
+        df_processed, target_market, training_horizon_seconds
+    )
+    
+    if eval_results:
+        logger.info("Training pipeline completed successfully!")
+        return {
+            'training_results': training_results,
+            'evaluation_results': eval_results,
+            'model_path': model_path,
+            'scaler_path': scaler_path,
+            'features_path': features_path
+        }
+    else:
+        logger.warning("Training completed but evaluation failed")
+        return {
+            'training_results': training_results,
+            'model_path': model_path,
+            'scaler_path': scaler_path,
+            'features_path': features_path
+        }
 
-    train_model(df_final, features_list=final_features_to_use, target_col='label', market_to_predict=target_market)
-
-    logger.info("ML training pipeline finished.")
+def generate_feature_importance_analysis(model_path: str, scaler_path: str, 
+                                       features_path: str, df: pl.DataFrame,
+                                       market_to_predict: str = 'SOL_USDT',
+                                       n_samples: int = 1000):
+    """
+    Generate feature importance analysis using permutation importance
+    
+    Args:
+        model_path: Path to trained model
+        scaler_path: Path to scaler
+        features_path: Path to features list
+        df: DataFrame with data
+        market_to_predict: Market to analyze
+        n_samples: Number of samples to use for analysis
+        
+    Returns:
+        Dictionary with feature importance scores
+    """
+    logger.info("Generating feature importance analysis...")
+    
+    try:
+        # Load model and components
+        model, scaler, model_info = load_quantile_model(model_path, scaler_path)
+        features_list = joblib.load(features_path)
+        
+        # Prepare data
+        trainer = QuantileTrainer(model_info['config'])
+        X, y_returns, valid_mask = trainer.prepare_data(
+            df, features_list, market_to_predict, 3600
+        )
+        
+        # Use subset for efficiency
+        X_valid = X[valid_mask]
+        y_valid = y_returns[valid_mask]
+        
+        if len(X_valid) > n_samples:
+            indices = np.random.choice(len(X_valid), n_samples, replace=False)
+            X_subset = X_valid[indices]
+            y_subset = y_valid[indices]
+        else:
+            X_subset = X_valid
+            y_subset = y_valid
+        
+        # Create quantile targets
+        y_quantiles, _ = trainer.create_quantile_targets(y_subset, n_quantiles=10)
+        
+        # Scale features
+        X_scaled = scaler.transform(X_subset)
+        
+        # Get baseline accuracy
+        device = next(model.parameters()).device
+        X_tensor = torch.FloatTensor(X_scaled).to(device)
+        
+        with torch.no_grad():
+            _, baseline_preds, _ = model.predict_quantiles(X_tensor)
+            baseline_preds = baseline_preds.cpu().numpy()
+        
+        baseline_accuracy = np.mean(baseline_preds == y_quantiles)
+        
+        # Calculate permutation importance
+        feature_importance = {}
+        
+        for i, feature_name in enumerate(features_list):
+            # Permute feature
+            X_permuted = X_scaled.copy()
+            np.random.shuffle(X_permuted[:, i])
+            
+            # Get predictions with permuted feature
+            X_perm_tensor = torch.FloatTensor(X_permuted).to(device)
+            with torch.no_grad():
+                _, perm_preds, _ = model.predict_quantiles(X_perm_tensor)
+                perm_preds = perm_preds.cpu().numpy()
+            
+            perm_accuracy = np.mean(perm_preds == y_quantiles)
+            importance = baseline_accuracy - perm_accuracy
+            feature_importance[feature_name] = importance
+        
+        # Sort by importance
+        sorted_importance = dict(sorted(feature_importance.items(), 
+                                      key=lambda x: x[1], reverse=True))
+        
+        logger.info("Top 10 most important features:")
+        for i, (feature, importance) in enumerate(list(sorted_importance.items())[:10]):
+            logger.info(f"  {i+1}. {feature}: {importance:.4f}")
+        
+        return sorted_importance
+        
+    except Exception as e:
+        logger.error(f"Error in feature importance analysis: {e}")
+        return None
 
 if __name__ == "__main__":
     logger.info("model_trainer.py executed directly. To run the full pipeline, run main.py.")
